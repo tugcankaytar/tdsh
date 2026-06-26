@@ -90,11 +90,13 @@ int main(int argc, char *argv[]) {
 
 	int recvbuflen = DEFAULT_BUFLEN;
 
-	const char *sendbuf = "this is a test";
+	//const char *sendbuf = "this is a test";
+	unsigned char prelogin[] = { 0x12, 0x01, 0x00, 0x2F, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x1A, 0x00, 0x06, 0x01, 0x00, 0x20, 0x00, 0x01, 0x02, 0x00, 0x21, 0x00, 0x01, 0x03, 0x00, 0x22, 0x00, 0x04, 0x04, 0x00, 0x26, 0x00, 0x01, 0xFF, 0x09, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0xB8, 0x0D, 0x00, 0x00, 0x01 };
+
 	char recvbuf[DEFAULT_BUFLEN];
 
 	// Send an initial buffer
-	iResult = send(ConnectSocket, sendbuf, (int) strlen(sendbuf), 0);
+	iResult = send(ConnectSocket, (const char *)prelogin, sizeof(prelogin), 0);
 	if (iResult == SOCKET_ERROR) {
 	    printf("send failed: %d\n", WSAGetLastError());
 	    closesocket(ConnectSocket);
@@ -118,7 +120,10 @@ int main(int argc, char *argv[]) {
 	do {
 	    iResult = recv(ConnectSocket, recvbuf, recvbuflen, 0);
 	    if (iResult > 0)
-	        printf("Bytes received: %d\n", iResult);
+	    		for (int i = 0; i < iResult; ++i)
+	    		{
+	        	printf("%02X ", (unsigned char)recvbuf[i]);
+	    		}
 	    else if (iResult == 0)
 	        printf("Connection closed\n");
 	    else
