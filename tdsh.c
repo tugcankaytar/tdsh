@@ -8,6 +8,11 @@
 #include <iphlpapi.h>
 #include <stdio.h>
 
+
+#include <openssl/ssl.h>
+#include <openssl/err.h>
+
+
 int main(int argc, char *argv[]) {
 
   if (argc < 2) {
@@ -86,14 +91,14 @@ int main(int argc, char *argv[]) {
 	    return 1;
 	}
 
-	#define DEFAULT_BUFLEN 512
+	#define DEFAULT_BUFLEN 16384
 
 	int recvbuflen = DEFAULT_BUFLEN;
 
 	//const char *sendbuf = "this is a test";
 	unsigned char prelogin[] = { 0x12, 0x01, 0x00, 0x2F, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x1A, 0x00, 0x06, 0x01, 0x00, 0x20, 0x00, 0x01, 0x02, 0x00, 0x21, 0x00, 0x01, 0x03, 0x00, 0x22, 0x00, 0x04, 0x04, 0x00, 0x26, 0x00, 0x01, 0xFF, 0x09, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0xB8, 0x0D, 0x00, 0x00, 0x01 };
 
-	char recvbuf[DEFAULT_BUFLEN];
+	unsigned char recvbuf[DEFAULT_BUFLEN];
 
 	// Send an initial buffer
 	iResult = send(ConnectSocket, (const char *)prelogin, sizeof(prelogin), 0);
@@ -106,11 +111,67 @@ int main(int argc, char *argv[]) {
 
 	printf("Bytes Sent: %d\n", iResult);
 
+	int prelogin_resp = recv(ConnectSocket, (char*)recvbuf, recvbuflen, 0);
+	printf("pre-login cevabi alindi: %d byte\n", prelogin_resp);
+
+
+	const SSL_METHOD *method = TLS_client_method();
+    SSL_CTX *ctx = SSL_CTX_new(method);
+    if (!ctx) {
+        ERR_print_errors_fp(stderr);
+        return 1;
+  }
+
+  SSL *ssl = SSL_new(ctx);
+  BIO *rbio = BIO_new(BIO_s_mem());
+  BIO *wbio = BIO_new(BIO_s_mem());
+  unsigned char tlsbuf[4096];
+
+  SSL_set_bio(ssl, rbio, wbio);
+  SSL_set_connect_state(ssl);
+
+  while (1) {
+    int ret = SSL_connect(ssl);
+    int err = SSL_get_error(ssl, ret);
+		int n = BIO_read(wbio, tlsbuf, sizeof(tlsbuf));
+    if (n > 0) {
+    	unsigned char tlsHeader[8] = {0x12, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+			
+			int total = 8 + n;
+			tlsHeader[2] = (total >> 8) & 0xFF;
+			tlsHeader[3] = total & 0xFF;
+
+      send(ConnectSocket, (const char*)tlsHeader, 8, 0);   // önce header
+			send(ConnectSocket, (const char*)tlsbuf, n, 0);      // sonra TLS payload
+    }
+
+
+    if (ret == 1) { printf("HANDSHAKE TAMAM!\n"); break; }
+
+    if (err != SSL_ERROR_WANT_READ && err != SSL_ERROR_WANT_WRITE) {
+        ERR_print_errors_fp(stderr); break;
+    }
+
+
+    if (err == SSL_ERROR_WANT_READ) {
+        int r = recv(ConnectSocket, (char*)recvbuf, recvbuflen, 0);
+          printf(">>> recv %d byte, ilk byte'lar: ", r);
+		    for (int i = 0; i < (r < 12 ? r : 12); i++)
+		        printf("%02X ", recvbuf[i]);
+		    printf("\n");  
+        if (r > 8) BIO_write(rbio, (char*)recvbuf + 8, r - 8);
+    }
+
+	}
+
 	// shutdown the connection for sending since no more data will be sent
 	// the client can still use the ConnectSocket for receiving data
 	iResult = shutdown(ConnectSocket, SD_SEND);
 	if (iResult == SOCKET_ERROR) {
 	    printf("shutdown failed: %d\n", WSAGetLastError());
+		  SSL_shutdown(ssl);
+		  SSL_free(ssl);
+		  SSL_CTX_free(ctx);
 	    closesocket(ConnectSocket);
 	    WSACleanup();
 	    return 1;
@@ -118,7 +179,7 @@ int main(int argc, char *argv[]) {
 
 	// Receive data until the server closes the connection
 	do {
-	    iResult = recv(ConnectSocket, recvbuf, recvbuflen, 0);
+	    iResult = recv(ConnectSocket, (char*)recvbuf, recvbuflen, 0);
 	    if (iResult > 0)
 	    		for (int i = 0; i < iResult; ++i)
 	    		{
