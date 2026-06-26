@@ -305,11 +305,6 @@ static int tds_feed_incoming(SSL *ssl, SOCKET s, unsigned char *recvbuf, int rec
     if (r <= 0)
         return r;   /* 0: closed, <0: error */
 
-    dbg(">>> recv %d bytes, first bytes:", r);
-    for (int i = 0; i < (r < 12 ? r : 12); i++)
-        dbg(" %02X", recvbuf[i]);
-    dbg("\n");
-
     if (r > TDS_HEADER_LEN) {
         dbg(">>> recv %d bytes, first bytes:", r);
             for (int i = 0; i < (r < 32 ? r : 32); i++)   // 12 yerine 32
@@ -430,10 +425,7 @@ printf("password received by program: '%s' (len %zu)\n", password, strlen(passwo
 
   printf("[3] tds_send_app_data returned: %d\n", sent);
   if (sent <= 0) { printf("[!] login7 could not be sent\n"); return -1; }
-  if (sent <= 0) {
-      printf("[!] login7 could not be sent\n");
-      return -1;
-  }
+
   DWORD timeout = 15000;
 setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout));
 
