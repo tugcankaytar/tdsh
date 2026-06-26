@@ -6,7 +6,7 @@
  *   2) tds_send_prelogin — send pre-login, drain the response (ENCRYPTION=03 expected)
  *   3) ssl_setup         — set up OpenSSL context + memory BIOs
  *   4) tds_tls_handshake — run the TLS handshake wrapped inside TDS packets
- *   (next: login7, query — over the encrypted channel, via tds_flush/feed helpers)
+ *   5) Login7            — build and send LOGIN7, confirm LOGINACK
  */
 
 #ifndef WIN32_LEAN_AND_MEAN
@@ -28,11 +28,11 @@
 #define TLS_BUFLEN       4096
 
 #define TDS_PKT_PRELOGIN 0x12   /* pre-login and TLS-handshake packets are wrapped with this type */
-#define TDS_PKT_LOGIN7 	 0x10   /* Login7 and TLS-handshake packets are wrapped with this type */
+#define TDS_PKT_LOGIN7   0x10   /* Login7 packet type */
 #define TDS_STATUS_EOM   0x01   /* End Of Message */
 #define TDS_HEADER_LEN   8      /* every TDS packet starts with an 8-byte header */
 
-#define DEBUG 1                 /* 1: diagnostic output on, 0: off */
+#define DEBUG 0                 /* 1: diagnostic output on, 0: off */
 #define dbg(...) do { if (DEBUG) printf(__VA_ARGS__); } while (0)
 
 /* Pre-login body: example packet from MS-TDS spec 4.1 (47 bytes including header).
@@ -68,7 +68,7 @@ static const unsigned char PRELOGIN_PACKET[] = {
 
 /* LOGIN7 fixed-length header (36 bytes), per MS-TDS 2.2.6.4.
  * Comes right after the 8-byte TDS packet header. Values taken from the
- * spec's section 4.2 example; only Length is patched at runtime. 
+ * spec's section 4.2 example; only Length is patched at runtime.
 */
 static unsigned char LOGIN7_HEADER[] = {
   0x00, 0x00, 0x00, 0x00,   /* Length: total LOGIN7 length (this header +
@@ -111,7 +111,7 @@ static unsigned char LOGIN7_HEADER[] = {
  * ============================================================ */
 void ascii_to_utf16le(const char *ascii_str, uint16_t *utf16_str) {
     while (*ascii_str != '\0') {
-        *utf16_str = (uint16_t)(*ascii_str); 
+        *utf16_str = (uint16_t)(*ascii_str);
         ascii_str++;
         utf16_str++;
     }
@@ -131,10 +131,10 @@ void apply_transform_utf16le(uint8_t *data, size_t length) {
  *  Fill login7 packet
  * ============================================================ */
 static void write_field(unsigned char *login7,
-                        int *table_pos,    		 // tablo imleci (pointer — güncellenecek)
-                        int *data_pos,     		 // data imleci (pointer — güncellenecek)
-                        const uint16_t *data,  // UTF-16LE veri
-                        int char_count)   		 // karakter sayısı
+                        int *table_pos,        // table cursor (pointer — gets updated)
+                        int *data_pos,         // data cursor (pointer — gets updated)
+                        const uint16_t *data,  // UTF-16LE data
+                        int char_count)        // number of characters
 {
   login7[*table_pos + 0] = (*data_pos) & 0xFF;        // offset, low byte first
   login7[*table_pos + 1] = (*data_pos >> 8) & 0xFF;   // offset, high byte
@@ -232,7 +232,7 @@ static int tds_send_app_data(SSL *ssl, SOCKET s, const unsigned char *data, int 
     unsigned char tlsbuf[TLS_BUFLEN];
     BIO *wbio = SSL_get_wbio(ssl);
     int n = BIO_read(wbio, tlsbuf, sizeof(tlsbuf));
-    printf("BIO_read got %d, wbio still pending: %d\n", n, BIO_pending(wbio));
+    dbg("BIO_read got %d, wbio still pending: %d\n", n, BIO_pending(wbio));
     if (n <= 0) return -1;
 
     if (send(s, (const char *)tlsbuf, n, 0) == SOCKET_ERROR) {
@@ -276,7 +276,7 @@ static SSL *ssl_setup(SSL_CTX **out_ctx)
 }
 
 /* If OpenSSL has data waiting in wbio, wrap it in TDS and write it to the socket.
- * The transport mechanic reused throughout the handshake and beyond. */
+ * The transport mechanic reused throughout the handshake. */
 static int tds_flush_outgoing(SSL *ssl, SOCKET s, unsigned char type)
 {
     unsigned char tlsbuf[TLS_BUFLEN];
@@ -286,7 +286,7 @@ static int tds_flush_outgoing(SSL *ssl, SOCKET s, unsigned char type)
     if (n <= 0)
         return 0;
 
-    tds_build_header(tlsbuf, type, n);   // header'ı tamponun başına yaz
+    tds_build_header(tlsbuf, type, n);   // header at the start of the buffer
 
     if (send(s, (const char *)tlsbuf, TDS_HEADER_LEN + n, 0) == SOCKET_ERROR) {
         printf("TLS payload send failed: %d\n", WSAGetLastError());
@@ -307,9 +307,9 @@ static int tds_feed_incoming(SSL *ssl, SOCKET s, unsigned char *recvbuf, int rec
 
     if (r > TDS_HEADER_LEN) {
         dbg(">>> recv %d bytes, first bytes:", r);
-            for (int i = 0; i < (r < 32 ? r : 32); i++)   // 12 yerine 32
-                dbg(" %02X", recvbuf[i]);
-            dbg("\n");
+        for (int i = 0; i < (r < 32 ? r : 32); i++)
+            dbg(" %02X", recvbuf[i]);
+        dbg("\n");
         BIO_write(SSL_get_rbio(ssl), recvbuf + TDS_HEADER_LEN, r - TDS_HEADER_LEN);
     }
     return r;
@@ -327,7 +327,7 @@ static int tds_tls_handshake(SSL *ssl, SOCKET s, unsigned char *recvbuf, int rec
             return -1;
 
         if (ret == 1) {
-            dbg("HANDSHAKE COMPLETE!\n");
+            printf("HANDSHAKE COMPLETE\n");
             return 0;
         }
 
@@ -346,7 +346,8 @@ static int tds_tls_handshake(SSL *ssl, SOCKET s, unsigned char *recvbuf, int rec
     }
 }
 
-/* Login7 Function */
+/* Builds and sends a LOGIN7 packet, then confirms the LOGINACK token.
+ * Returns 0 on successful login, -1 otherwise. */
 static int Login7(SSL *ssl, SOCKET s, unsigned char *recvbuf, int recvbuflen,
                   const char *username, const char *password, const char *database) {
   uint16_t u16_username[1024];
@@ -360,27 +361,25 @@ static int Login7(SSL *ssl, SOCKET s, unsigned char *recvbuf, int recvbuflen,
   int user_bytes = strlen(username) * 2;
   int pass_bytes = strlen(password) * 2;
 
-  printf("username (UTF-16LE): ");
+  dbg("username (UTF-16LE): ");
   for (int i = 0; i < user_bytes; i++)
-      printf("%02X ", ((uint8_t*)u16_username)[i]);
-  printf("\n");
+      dbg("%02X ", ((uint8_t*)u16_username)[i]);
+  dbg("\n");
 
-  // obfuscate password (byte düzeyinde, UTF-16LE veri üzerinde)
+  // obfuscate password (byte level, over the UTF-16LE data)
   apply_transform_utf16le((uint8_t*)u16_password, pass_bytes);
-printf("password received by program: '%s' (len %zu)\n", password, strlen(password));  
 
-  printf("password (obfuscated): ");
+  dbg("password (obfuscated): ");
   for (int i = 0; i < pass_bytes; i++)
-      printf("%02X ", ((uint8_t*)u16_password)[i]);
-  printf("\n");
-
+      dbg("%02X ", ((uint8_t*)u16_password)[i]);
+  dbg("\n");
 
   unsigned char login7[512];
-  memset(login7, 0, sizeof(login7));   // önce sıfırla, çöp kalmasın
+  memset(login7, 0, sizeof(login7));   // zero first, leave no garbage
   int data_pos = 94;   // first data offset: 36 (fixed header) + 58 (offset table)
-	memcpy(login7, LOGIN7_HEADER, sizeof(LOGIN7_HEADER));
+  memcpy(login7, LOGIN7_HEADER, sizeof(LOGIN7_HEADER));
 
-	int table_pos = 36;
+  int table_pos = 36;
 
   // LOGIN7 expects a fixed field order. We fill UserName, Password, Database;
   // the rest are empty (char_count 0). Order must match the spec.
@@ -392,74 +391,69 @@ printf("password received by program: '%s' (len %zu)\n", password, strlen(passwo
   write_field(login7, &table_pos, &data_pos, NULL, 0);  // Unused/Extension
   write_field(login7, &table_pos, &data_pos, NULL, 0);  // CltIntName
   write_field(login7, &table_pos, &data_pos, NULL, 0);  // Language
-  write_field(login7, &table_pos, &data_pos, u16_database, strlen(database));  // Database — DOLU
-  memset(login7 + table_pos, 0, 6);
+  write_field(login7, &table_pos, &data_pos, u16_database, strlen(database));  // Database
+  memset(login7 + table_pos, 0, 6);  // ClientID (6-byte MAC) — written directly
   table_pos += 6;
   write_field(login7, &table_pos, &data_pos, NULL, 0);  // SSPI
   write_field(login7, &table_pos, &data_pos, NULL, 0);  // AtchDBFile
   write_field(login7, &table_pos, &data_pos, NULL, 0);  // ChangePassword
-  memset(login7 + table_pos, 0, 4);
+  memset(login7 + table_pos, 0, 4);  // SSPILong
   table_pos += 4;
 
-	printf("table_pos=%d (should be 94), data_pos=%d\n", table_pos, data_pos);
-  // debug: dump the packet built so far
-  printf("login7 so far (%d bytes):\n", data_pos);
+  dbg("table_pos=%d (should be 94), data_pos=%d\n", table_pos, data_pos);
+  dbg("login7 so far (%d bytes):\n", data_pos);
   for (int i = 0; i < data_pos; i++) {
-      printf("%02X ", login7[i]);
-      if ((i + 1) % 16 == 0) printf("\n");
+      dbg("%02X ", login7[i]);
+      if ((i + 1) % 16 == 0) dbg("\n");
   }
-  printf("\n");
+  dbg("\n");
 
+  // patch the Length field (first 4 bytes) with the total packet length, little-endian
   login7[0] = data_pos & 0xFF;
   login7[1] = (data_pos >> 8) & 0xFF;
   login7[2] = (data_pos >> 16) & 0xFF;
   login7[3] = (data_pos >> 24) & 0xFF;
+
+  // wrap the login7 body in a TDS packet (header goes INSIDE the TLS payload)
   unsigned char tds_login[512];
   tds_build_header(tds_login, TDS_PKT_LOGIN7, data_pos);
   memcpy(tds_login + TDS_HEADER_LEN, login7, data_pos);
   int tds_total = TDS_HEADER_LEN + data_pos;
 
-// --- send login7 over the encrypted channel ---
-  printf("[1] sending login7 (%d bytes incl TDS header)\n", tds_total);
+  dbg("sending login7 (%d bytes incl TDS header)\n", tds_total);
   int sent = tds_send_app_data(ssl, s, tds_login, tds_total);
-
-  printf("[3] tds_send_app_data returned: %d\n", sent);
-  if (sent <= 0) { printf("[!] login7 could not be sent\n"); return -1; }
+  dbg("tds_send_app_data returned: %d\n", sent);
+  if (sent <= 0) { printf("login7 could not be sent\n"); return -1; }
 
   DWORD timeout = 15000;
-setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout));
+  setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout));
 
-  printf("[4] waiting for response (recv may block here)...\n");
   int r = tds_feed_incoming(ssl, s, recvbuf, recvbuflen);
-  printf("[5] tds_feed_incoming returned: %d\n", r);
+  dbg("tds_feed_incoming returned: %d\n", r);
   if (r <= 0) {
-      printf("[!] no login response: %d\n", r);
+      printf("no login response: %d\n", r);
       return -1;
   }
 
- // response is plaintext TDS (server doesn't encrypt post-login here).
+  // response is plaintext TDS (server doesn't encrypt post-login here).
   // parse token stream starting after the 8-byte TDS header.
   unsigned char *tok = recvbuf + TDS_HEADER_LEN;
   int tok_len = r - TDS_HEADER_LEN;
 
-  printf("[6] login response tokens: ");
+  dbg("login response tokens: ");
   for (int i = 0; i < (tok_len < 32 ? tok_len : 32); i++)
-      printf("%02X ", tok[i]);
-  printf("\n");
+      dbg("%02X ", tok[i]);
+  dbg("\n");
 
   // scan for LOGINACK (0xAD) — its presence means login succeeded
   int login_ok = 0;
   for (int i = 0; i < tok_len; i++) {
       if (tok[i] == 0xAD) { login_ok = 1; break; }
   }
-  if (login_ok) {
-      printf("LOGINACK found — login successful!\n");
-      return 0;
-  } else {
-      printf("no LOGINACK in response\n");
+  if (!login_ok) {
+      printf("no LOGINACK in response — login failed\n");
       return -1;
   }
-
   return 0;
 }
 
@@ -469,10 +463,10 @@ setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout));
 
 int main(int argc, char *argv[])
 {
-	if (argc < 6) {
-	    printf("Usage: %s <host> <port> <username> <password> <database>\n", argv[0]);
-	    return 1;
-	}
+  if (argc < 6) {
+      printf("Usage: %s <host> <port> <username> <password> <database>\n", argv[0]);
+      return 1;
+  }
 
   WSADATA wsaData;
   if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
@@ -486,7 +480,7 @@ int main(int argc, char *argv[])
   SSL *ssl     = NULL;
   unsigned char recvbuf[RECV_BUFLEN];
 
-  s = tcp_connect(argv[1],argv[2]);
+  s = tcp_connect(argv[1], argv[2]);
   if (s == INVALID_SOCKET)                                  goto cleanup;
 
   if (tds_send_prelogin(s, recvbuf, RECV_BUFLEN) != 0)      goto cleanup;
@@ -498,8 +492,8 @@ int main(int argc, char *argv[])
 
   printf("TLS channel established\n");
 
-  int login = Login7(ssl, s, recvbuf, RECV_BUFLEN, argv[3], argv[4], argv[5]);
-  if (login != 0)																								goto cleanup;
+  if (Login7(ssl, s, recvbuf, RECV_BUFLEN, argv[3], argv[4], argv[5]) != 0)
+      goto cleanup;
 
   printf("Login Success\n");
   rc = 0;
