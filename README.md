@@ -3,7 +3,9 @@
 A hand-written client for Microsoft SQL Server's wire protocol (TDS), built from
 scratch in C with no database driver. No FreeTDS, no ODBC — just sockets, OpenSSL,
 and the [MS-TDS] specification. It speaks pre-login, negotiates TLS *inside* TDS
-packets, and authenticates with a dynamically built LOGIN7 packet.
+packets, authenticates with a dynamically built LOGIN7 packet, and then runs
+T-SQL from an interactive prompt, rendering result sets as aligned tables — a
+`psql`-style terminal client for SQL Server.
 
 This is a learning project: the goal was to understand the protocol down to the
 byte, not to ship a production driver.
@@ -19,7 +21,12 @@ byte, not to ship a production driver.
 4. Builds and sends a **LOGIN7** packet over the encrypted channel: fixed header,
    a dynamically computed offset/length table, UTF-16LE field data, and the
    password obfuscated with the TDS nibble-swap + XOR 0xA5 scheme.
-5. Parses the login response and confirms a **LOGINACK** token.
+5. Parses the login response by walking the **token stream** and confirms a
+   **LOGINACK** token (surfacing the server's message if an ERROR token appears).
+6. Drops into an **interactive REPL**: each line you type is sent as a
+   **SQL batch** (`0x01` packet), the response is reassembled across TDS packets,
+   its **result token stream** is parsed (`COLMETADATA` → `ROW`/`NBCROW` → `DONE`),
+   and rows are printed as an **aligned table**.
 
 ## Build
 
@@ -45,7 +52,28 @@ Example:
 ./tdsh.exe 192.168.1.50 1433 sa MyPassword master
 ```
 
-A successful run ends with `LOGINACK found — login successful!`.
+After `Login Success` you land in the interactive prompt. Type a T-SQL statement,
+press Enter, and the result comes back as a table. `exit`, `quit`, or EOF
+(`Ctrl+Z` then Enter on Windows) leaves the loop.
+
+```
+Login Success
+
+tdsh interactive — enter T-SQL and press Enter. Type 'exit' or 'quit' to leave.
+tdsh> SELECT name, database_id FROM sys.databases
+ name    | database_id
+---------+-------------
+ master  | 1
+ tempdb  | 2
+ model   | 3
+ msdb    | 4
+(4 rows)
+
+tdsh> exit
+```
+
+Each line is sent as its own batch, so `GO`-style multi-statement buffering is not
+needed — separate statements with `;` within a line if you want several at once.
 
 ## How it is structured
 
@@ -54,16 +82,43 @@ The code is one file, split into single-responsibility functions:
 | Function | Responsibility |
 |---|---|
 | `tcp_connect` | Open the TCP socket |
-| `tds_send_prelogin` | Send pre-login, drain the response |
+| `tds_send_prelogin` | Send pre-login, parse the negotiated encryption mode |
 | `ssl_setup` | Create the OpenSSL context + memory BIOs |
 | `tds_flush_outgoing` | Pull TLS bytes from OpenSSL, wrap in TDS, send (handshake) |
 | `tds_feed_incoming` | Read a TDS packet, strip its header, feed TLS into OpenSSL |
 | `tds_tls_handshake` | Drive `SSL_connect` by hand across the BIO bridge |
 | `tds_send_app_data` | Send post-handshake data (TDS header already inside the TLS payload) |
 | `write_field` | Write one LOGIN7 offset/length pair and its UTF-16LE data |
-| `ascii_to_utf16le` | Convert a string to UTF-16LE |
+| `ascii_to_utf16le` | Convert a string to UTF-16LE (bounds-checked) |
 | `apply_transform_utf16le` | TDS password obfuscation (nibble-swap + XOR 0xA5) |
 | `Login7` | Build the LOGIN7 packet and authenticate |
+| `parse_login_response` | Walk the login token stream, confirm LOGINACK, print ERROR |
+| `tds_send_message` | Frame a message into TDS packets and send (TLS or plaintext) |
+| `tds_read_message` | Reassemble a full TDS message across packets (TLS or plaintext) |
+| `parse_type_info` | Decode a column's `TYPE_INFO` from `COLMETADATA` |
+| `read_cell` | Read one row value (all length encodings incl. PLP/text) |
+| `format_cell` | Format a raw value as text (ints, decimal, dates, strings, …) |
+| `parse_result_stream` | Walk the result token stream and render tables |
+| `tds_exec` | Send a T-SQL batch and print the result |
+| `run_repl` | Interactive read-eval-print loop |
+
+## Result-set support
+
+`parse_result_stream` walks the token stream a query returns and renders each
+result set as a table. It handles:
+
+- **Tokens:** `COLMETADATA` (0x81), `ROW` (0xD1), `NBCROW` (0xD2, null-bitmap
+  compressed rows), `DONE`/`DONEPROC`/`DONEINPROC`, `RETURNSTATUS`, and the
+  variable-length `ERROR`/`INFO`/`ENVCHANGE`/`ORDER`/… tokens.
+- **All row length encodings:** fixed-length, byte-length, `USHORT`-length,
+  `LONG`-length (text/ntext/image via text pointer), and **PLP** for the
+  `MAX` types.
+- **Value formatting:** integers, `bit`, `real`/`float`, `money`,
+  `decimal`/`numeric` (arbitrary precision via base-10 conversion),
+  `date`/`datetime`/`smalldatetime`/`datetime2`/`time`/`datetimeoffset`,
+  `uniqueidentifier`, `(n)char`/`(n)varchar`/text, and `binary`/`varbinary` as
+  hex. `NULL` is shown as `NULL`. Unknown types stop the parse rather than
+  misalign the stream.
 
 ## Notes & limitations
 
@@ -72,20 +127,34 @@ This is intentionally minimal and lab-oriented:
 - **Certificate verification is disabled** (`SSL_VERIFY_NONE`) to accept the
   self-signed certificate a default SQL Server presents. Do not use this against
   a server you don't control without adding proper verification.
-- **One TDS packet per `recv` is assumed.** A production client must reassemble
-  packets using the length field in the TDS header, since TCP does not preserve
-  message boundaries.
-- **The login response is read as plaintext TDS.** With this server's encryption
-  mode, only the login exchange is encrypted; the post-login response arrives
-  unencrypted, so it is parsed directly rather than through `SSL_read`.
-- ASCII-only field values are assumed for username/password/database.
+- **Encryption is negotiated, not assumed.** The client requests `ENCRYPT_OFF`
+  in pre-login and then reads the server's `ENCRYPTION` response. If the server
+  chose `ENCRYPT_ON`/`ENCRYPT_REQ`, the whole session is TLS: the login response
+  and every query travel through `SSL_write`/`SSL_read`. If it chose
+  `ENCRYPT_OFF`, only the login is encrypted and query traffic is plaintext TDS.
+  The negotiated mode is printed at startup (`session encryption: ON/OFF`).
+  After the TLS handshake, TLS records are sent raw (the TDS packets become the
+  plaintext *inside* them); during the handshake they are wrapped inside `0x12`
+  TDS packets.
+- **MARS is deliberately disabled.** The pre-login requests `MARS = 0`. With
+  MARS enabled the server expects every post-login packet to be wrapped in an
+  SMP (Session Multiplexing Protocol) header, which this client does not
+  implement — negotiating MARS on makes SQL Server accept the login but then
+  drop the connection on the first SQL batch.
+- **Query responses are fully reassembled** across TDS packets and `recv`
+  boundaries (via `tds_read_message`); the pre-login/handshake path still assumes
+  one packet per `recv`.
+- ASCII-only is assumed for credentials and for the SQL text you type; non-ASCII
+  characters in returned rows are printed as `?`.
+- Rows are buffered in memory before rendering (capped at 100,000 per result set,
+  columns truncated at 60 chars for display).
 
 ## What's next
 
-- Send a SQL batch (`0x01` packet) and parse the result token stream
-  (COLMETADATA → ROW → DONE).
-- Render result rows as an aligned table.
-- A REPL loop for interactive queries.
+- Multi-line statement buffering (a `GO`-style terminator).
+- UTF-8 output so non-ASCII data renders correctly.
+- Column type/width hints and right-alignment for numeric columns.
+- Session encryption support (`ENCRYPT_ON`) for the query path.
 
 ## Why
 
