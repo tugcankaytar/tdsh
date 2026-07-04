@@ -61,12 +61,12 @@ Login Success
 
 tdsh interactive — enter T-SQL and press Enter. Type 'exit' or 'quit' to leave.
 tdsh> SELECT name, database_id FROM sys.databases
- name    | database_id
----------+-------------
- master  | 1
- tempdb  | 2
- model   | 3
- msdb    | 4
+ name   | database_id
+--------+-------------
+ master |           1
+ tempdb |           2
+ model  |           3
+ msdb   |           4
 (4 rows)
 
 tdsh> exit
@@ -74,6 +74,22 @@ tdsh> exit
 
 Each line is sent as its own batch, so `GO`-style multi-statement buffering is not
 needed — separate statements with `;` within a line if you want several at once.
+
+Wide result sets (more columns than fit the terminal) are shown automatically in
+an **expanded** layout — one `column | value` line per field, grouped per record,
+like psql's `\x`:
+
+```
+tdsh> SELECT * FROM ETKINLIK
+-[ RECORD 1 ]-+------------------------
+id            | 1
+ad            | Bahar Konseri
+tarih         | 2024-04-20
+...
+```
+
+Meta-commands: `\x` toggles expanded display on/off (off = auto), `\clear` (or
+`\cls`) clears the screen.
 
 ## How it is structured
 
@@ -144,17 +160,24 @@ This is intentionally minimal and lab-oriented:
 - **Query responses are fully reassembled** across TDS packets and `recv`
   boundaries (via `tds_read_message`); the pre-login/handshake path still assumes
   one packet per `recv`.
-- ASCII-only is assumed for credentials and for the SQL text you type; non-ASCII
-  characters in returned rows are printed as `?`.
-- Rows are buffered in memory before rendering (capped at 100,000 per result set,
-  columns truncated at 60 chars for display).
+- **Output is UTF-8.** The console output code page is switched to UTF-8, so
+  Turkish (and other) characters render correctly. `n(var)char`/`ntext` is
+  decoded from UTF-16LE; legacy single-byte `(var)char`/`text` is decoded via
+  the system ANSI code page (Windows-1254 on a Turkish system) — best-effort
+  when the column's collation differs from the system default. The SQL text you
+  type is assumed ASCII.
+- **Tables adapt to the terminal.** Column widths are measured in display
+  columns (UTF-8 aware); over-long cells are truncated with an ellipsis (`…`)
+  and numeric columns are right-justified. When a grid would be wider than the
+  terminal, output switches to an **expanded** (one field per line) layout —
+  toggle it manually with `\x`. Rows are buffered before rendering (capped at
+  100,000 per result set).
 
 ## What's next
 
 - Multi-line statement buffering (a `GO`-style terminator).
-- UTF-8 output so non-ASCII data renders correctly.
-- Column type/width hints and right-alignment for numeric columns.
 - Session encryption support (`ENCRYPT_ON`) for the query path.
+- Deriving the exact varchar code page from the column collation.
 
 ## Why
 

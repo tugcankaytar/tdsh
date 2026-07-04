@@ -47,9 +47,22 @@
  * traffic must go through SSL_read/SSL_write. Set from the pre-login response. */
 static int g_encrypt = 0;
 
-/* forward declaration: defined with the query-transport helpers below, but
- * Login7 already needs it to read the login response. */
+/* 1 => force expanded (one field per line) result display; 0 => auto (expanded
+ * only when a table is too wide for the terminal). Toggled with \x in the REPL. */
+static int g_expanded = 0;
+
+/* 1 => ANSI escape (virtual terminal) processing is enabled on the console, so
+ * \clear can wipe the scrollback with ESC[3J instead of just the visible area. */
+static int g_vt = 0;
+
+#ifndef ENABLE_VIRTUAL_TERMINAL_PROCESSING
+#define ENABLE_VIRTUAL_TERMINAL_PROCESSING 0x0004
+#endif
+
+/* forward declarations: defined further below, but needed earlier —
+ * tds_read_message by Login7, utf8_from_utf16le by print_error_token. */
 static unsigned char *tds_read_message(SSL *ssl, SOCKET s, int enc, int *outlen);
+static void utf8_from_utf16le(const unsigned char *v, int nbytes, char *out, int outcap);
 
 #define DEBUG 0                 /* 1: diagnostic output on, 0: off */
 #define dbg(...) do { if (DEBUG) printf(__VA_ARGS__); } while (0)
@@ -402,12 +415,9 @@ static void print_error_token(const unsigned char *p, int len)
     if (off + msg_chars * 2 > len)       /* clamp defensively */
         msg_chars = (len - off) / 2;
 
-    printf("server error: ");
-    for (int i = 0; i < msg_chars; i++) {
-        uint16_t c = p[off + i * 2] | (p[off + i * 2 + 1] << 8);
-        putchar(c < 0x80 ? (char)c : '?');   /* ASCII-print; non-ASCII -> '?' */
-    }
-    printf("\n");
+    char msg[2048];
+    utf8_from_utf16le(p + off, msg_chars * 2, msg, sizeof msg);
+    printf("server error: %s\n", msg);
 }
 
 /* Walks the TDS token stream of a login response and reports success/failure.
@@ -736,7 +746,6 @@ static unsigned char *tds_read_message(SSL *ssl, SOCKET s, int enc, int *outlen)
 #define MAX_COLS   1024
 #define CELL_MAX   4096   /* max formatted cell / assembled PLP value */
 #define MAX_ROWS   100000 /* safety cap on buffered rows per result set */
-#define COL_WIDTH_CAP 60  /* truncate very wide columns when rendering */
 
 /* how a value's length is encoded in a ROW */
 enum len_cat { LC_FIXED, LC_BYTE, LC_USHORT, LC_LONG, LC_PLP, LC_UNSUPPORTED };
@@ -820,6 +829,56 @@ static void fmt_time(unsigned long long value, int scale, char *out, int outcap)
         snprintf(out, outcap, "%02d:%02d:%02d.%0*llu", hh, mm, ss, scale, frac);
     else
         snprintf(out, outcap, "%02d:%02d:%02d", hh, mm, ss);
+}
+
+/* ---- UTF-8 output helpers (the console is switched to CP_UTF8 in main) ---- */
+
+/* Encode one Unicode code point as UTF-8 at out[j..]; returns the new j. */
+static int utf8_put(char *out, int j, int outcap, unsigned int cp)
+{
+    if (cp < 0x80) {
+        if (j + 1 < outcap) out[j++] = (char)cp;
+    } else if (cp < 0x800) {
+        if (j + 2 < outcap) { out[j++] = (char)(0xC0 | (cp >> 6)); out[j++] = (char)(0x80 | (cp & 0x3F)); }
+    } else if (cp < 0x10000) {
+        if (j + 3 < outcap) { out[j++] = (char)(0xE0 | (cp >> 12)); out[j++] = (char)(0x80 | ((cp >> 6) & 0x3F)); out[j++] = (char)(0x80 | (cp & 0x3F)); }
+    } else {
+        if (j + 4 < outcap) { out[j++] = (char)(0xF0 | (cp >> 18)); out[j++] = (char)(0x80 | ((cp >> 12) & 0x3F)); out[j++] = (char)(0x80 | ((cp >> 6) & 0x3F)); out[j++] = (char)(0x80 | (cp & 0x3F)); }
+    }
+    return j;
+}
+
+/* UTF-16LE bytes -> UTF-8 string (handles surrogate pairs). */
+static void utf8_from_utf16le(const unsigned char *v, int nbytes, char *out, int outcap)
+{
+    int j = 0;
+    for (int i = 0; i + 1 < nbytes; i += 2) {
+        unsigned int cp = v[i] | (v[i + 1] << 8);
+        if (cp >= 0xD800 && cp <= 0xDBFF && i + 3 < nbytes) {      /* high surrogate */
+            unsigned int lo = v[i + 2] | (v[i + 3] << 8);
+            if (lo >= 0xDC00 && lo <= 0xDFFF) {
+                cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+                i += 2;
+            }
+        }
+        j = utf8_put(out, j, outcap, cp);
+    }
+    out[j] = '\0';
+}
+
+/* Single-byte (collation codepage) bytes -> UTF-8, via the system ANSI codepage
+ * (Windows-1254 on a Turkish system). Best-effort for legacy varchar/char. */
+static void utf8_from_ansi(const unsigned char *v, int n, char *out, int outcap)
+{
+    wchar_t wbuf[CELL_MAX];
+    int wn = MultiByteToWideChar(CP_ACP, 0, (const char *)v, n, wbuf, CELL_MAX);
+    if (wn <= 0) {                                   /* fallback: copy raw bytes */
+        int cpy = n < outcap - 1 ? n : outcap - 1;
+        memcpy(out, v, cpy); out[cpy] = '\0'; return;
+    }
+    int bn = WideCharToMultiByte(CP_UTF8, 0, wbuf, wn, out, outcap - 1, NULL, NULL);
+    if (bn < 0) bn = 0;
+    out[bn] = '\0';
 }
 
 /* Formats one non-null value (raw bytes v[0..n)) into a text cell. */
@@ -946,21 +1005,12 @@ static void format_cell(const Column *c, const unsigned char *v, int n, char *ou
         out[j] = '\0';
         return;
     }
-    if (c->is_unicode) {                          /* UTF-16LE -> ASCII-ish */
-        int j = 0;
-        for (int k = 0; k + 1 < n && j < outcap - 1; k += 2) {
-            uint16_t ch = v[k] | (v[k + 1] << 8);
-            out[j++] = (ch && ch < 0x80) ? (char)ch : '?';
-        }
-        out[j] = '\0';
+    if (c->is_unicode) {                          /* n(var)char / ntext -> UTF-8 */
+        utf8_from_utf16le(v, n, out, outcap);
         return;
     }
-    /* single-byte char text */
-    {
-        int copy = n < outcap - 1 ? n : outcap - 1;
-        memcpy(out, v, copy);
-        out[copy] = '\0';
-    }
+    /* single-byte (var)char / text -> UTF-8 via the system ANSI codepage */
+    utf8_from_ansi(v, n, out, outcap);
 }
 
 /* Reads one column value out of a ROW at p (avail bytes left), formats it into
@@ -1135,19 +1185,14 @@ static int parse_type_info(const unsigned char *p, int avail, Column *col)
     return i;
 }
 
-/* Reads a B_VARCHAR (1-byte char count + UTF-16LE chars) into name (ASCII).
+/* Reads a B_VARCHAR (1-byte char count + UTF-16LE chars) into name as UTF-8.
  * Returns bytes consumed, or -1. */
 static int read_bvarchar_name(const unsigned char *p, int avail, char *name, int namecap)
 {
     if (avail < 1) return -1;
     int nchars = p[0];
     if (avail < 1 + nchars * 2) return -1;
-    int j = 0;
-    for (int k = 0; k < nchars && j < namecap - 1; k++) {
-        uint16_t ch = p[1 + k * 2] | (p[1 + k * 2 + 1] << 8);
-        name[j++] = (ch && ch < 0x80) ? (char)ch : '?';
-    }
-    name[j] = '\0';
+    utf8_from_utf16le(p + 1, nchars * 2, name, namecap);
     return 1 + nchars * 2;
 }
 
@@ -1180,45 +1225,167 @@ static char **table_new_row(Table *t)
 
 static void print_repeat(char ch, int n) { for (int i = 0; i < n; i++) putchar(ch); }
 
-static void table_render(Table *t)
+/* Display width of a UTF-8 string = number of code points (good enough for
+ * Latin/Turkish text; wide CJK glyphs are undercounted). */
+static int utf8_ncols(const char *s)
 {
-    if (t->ncols == 0) return;
+    int n = 0;
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++)
+        if ((*p & 0xC0) != 0x80) n++;                /* count non-continuation bytes */
+    return n;
+}
 
-    int width[MAX_COLS];
-    for (int c = 0; c < t->ncols; c++) {
-        int w = (int)strlen(t->cols[c].name);
-        for (int r = 0; r < t->nrows; r++) {
-            int cl = t->rows[r][c] ? (int)strlen(t->rows[r][c]) : 0;
-            if (cl > w) w = cl;
-        }
-        if (w > COL_WIDTH_CAP) w = COL_WIDTH_CAP;
-        width[c] = w;
+/* Print s truncated to at most `width` display columns (ellipsis if clipped),
+ * with no padding. Returns the number of display columns actually written. */
+static int print_clip(const char *s, int width)
+{
+    int dw = utf8_ncols(s);
+    if (dw <= width) { fputs(s, stdout); return dw; }
+    int keep = width > 0 ? width - 1 : 0;            /* leave 1 column for the ellipsis */
+    const char *p = s;
+    for (int cps = 0; *p && cps < keep; cps++) {
+        unsigned char c = (unsigned char)*p;
+        p += (c < 0x80) ? 1 : (c < 0xE0) ? 2 : (c < 0xF0) ? 3 : 4;
     }
+    fwrite(s, 1, (size_t)(p - s), stdout);
+    fputs("\xE2\x80\xA6", stdout);                   /* … */
+    return width;
+}
 
-    /* header */
-    for (int c = 0; c < t->ncols; c++) {
-        printf(" %-*.*s ", width[c], width[c], t->cols[c].name);
+/* Print s in exactly `width` display columns, right- or left-justified. */
+static void print_padded(const char *s, int width, int right)
+{
+    if (right) {
+        int dw = utf8_ncols(s);
+        if (dw < width) print_repeat(' ', width - dw);
+        print_clip(s, width);
+    } else {
+        int printed = print_clip(s, width);
+        print_repeat(' ', width - printed);
+    }
+}
+
+/* Terminal width in columns (falls back to 80 when output is not a console). */
+static int term_width(void)
+{
+    CONSOLE_SCREEN_BUFFER_INFO csbi;
+    if (GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), &csbi)) {
+        int w = csbi.srWindow.Right - csbi.srWindow.Left + 1;
+        if (w > 0) return w;
+    }
+    return 80;
+}
+
+/* Numeric columns are right-justified (looks cleaner, like psql). */
+static int col_is_numeric(uint8_t t)
+{
+    switch (t) {
+    case 0x30: case 0x34: case 0x38: case 0x7F: case 0x26:   /* int family */
+    case 0x32: case 0x68:                                    /* bit */
+    case 0x3B: case 0x3E: case 0x6D:                         /* real / float */
+    case 0x3C: case 0x7A: case 0x6E:                         /* money */
+    case 0x37: case 0x3F: case 0x6A: case 0x6C:              /* decimal / numeric */
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+#define NORMAL_CAP 60   /* max natural column width in the normal (grid) layout */
+
+static void print_rowcount(const Table *t)
+{
+    printf("(%d row%s)%s\n\n", t->nrows, t->nrows == 1 ? "" : "s",
+           t->truncated ? " [truncated]" : "");
+}
+
+/* Classic grid layout: header, separator, rows. w[] holds each column width. */
+static void render_normal(Table *t, const int *w)
+{
+    for (int c = 0; c < t->ncols; c++) {             /* header */
+        putchar(' ');
+        print_padded(t->cols[c].name, w[c], col_is_numeric(t->cols[c].type));
+        putchar(' ');
         if (c < t->ncols - 1) putchar('|');
     }
     putchar('\n');
-    for (int c = 0; c < t->ncols; c++) {
-        print_repeat('-', width[c] + 2);
+    for (int c = 0; c < t->ncols; c++) {             /* separator */
+        print_repeat('-', w[c] + 2);
         if (c < t->ncols - 1) putchar('+');
     }
     putchar('\n');
-
-    /* rows */
-    for (int r = 0; r < t->nrows; r++) {
+    for (int r = 0; r < t->nrows; r++) {             /* rows */
         for (int c = 0; c < t->ncols; c++) {
             const char *cell = t->rows[r][c] ? t->rows[r][c] : "";
-            printf(" %-*.*s ", width[c], width[c], cell);
+            putchar(' ');
+            print_padded(cell, w[c], col_is_numeric(t->cols[c].type));
+            putchar(' ');
             if (c < t->ncols - 1) putchar('|');
         }
         putchar('\n');
     }
+    print_rowcount(t);
+}
 
-    printf("(%d row%s)%s\n\n", t->nrows, t->nrows == 1 ? "" : "s",
-           t->truncated ? " [truncated]" : "");
+/* Expanded layout (psql's \x): one "column | value" line per field, grouped
+ * per record. Used for tables too wide to fit the terminal as a grid. */
+static void render_expanded(Table *t)
+{
+    int namew = 0;
+    for (int c = 0; c < t->ncols; c++) {
+        int l = utf8_ncols(t->cols[c].name);
+        if (l > namew) namew = l;
+    }
+    if (namew < 1)  namew = 1;
+    if (namew > 30) namew = 30;
+
+    int valw = term_width() - namew - 3;             /* "name | value" */
+    if (valw < 8) valw = 8;
+
+    for (int r = 0; r < t->nrows; r++) {
+        char label[48];
+        snprintf(label, sizeof label, "-[ RECORD %d ]", r + 1);
+        fputs(label, stdout);
+        for (int i = (int)strlen(label); i < namew + 1; i++) putchar('-');
+        putchar('+');
+        print_repeat('-', valw + 1);
+        putchar('\n');
+
+        for (int c = 0; c < t->ncols; c++) {
+            print_padded(t->cols[c].name, namew, 0);
+            fputs(" | ", stdout);
+            print_clip(t->rows[r][c] ? t->rows[r][c] : "", valw);   /* no trailing pad */
+            putchar('\n');
+        }
+    }
+    print_rowcount(t);
+}
+
+static void table_render(Table *t)
+{
+    if (t->ncols == 0) return;
+
+    /* natural width of each column = widest of its header and cells (display
+     * cols), capped so one long text column doesn't blow up the grid. */
+    int w[MAX_COLS];
+    long total = 2 * t->ncols + (t->ncols - 1);      /* borders/separators */
+    for (int c = 0; c < t->ncols; c++) {
+        int mx = utf8_ncols(t->cols[c].name);
+        for (int r = 0; r < t->nrows; r++) {
+            int cl = t->rows[r][c] ? utf8_ncols(t->rows[r][c]) : 0;
+            if (cl > mx) mx = cl;
+        }
+        if (mx < 1) mx = 1;
+        if (mx > NORMAL_CAP) mx = NORMAL_CAP;
+        w[c] = mx;
+        total += mx;
+    }
+
+    /* Grid when it fits; otherwise fall back to the readable expanded layout. */
+    if (g_expanded || total > term_width())
+        render_expanded(t);
+    else
+        render_normal(t, w);
 }
 
 /* Walks a result-set token stream and prints each result set as a table.
@@ -1345,6 +1512,33 @@ static int tds_exec(SSL *ssl, SOCKET s, const char *sql)
     return 0;
 }
 
+/* Clears the console. When ANSI/VT processing is available (Windows Terminal,
+ * modern conhost) it also wipes the scrollback so old output is truly gone and
+ * does not accumulate. Order matters: ESC[H homes the cursor, ESC[2J clears the
+ * screen (which pushes the current viewport into the scrollback on Windows
+ * Terminal), and ESC[3J must come LAST so it erases that pushed content too —
+ * otherwise the first \clear leaves the old lines behind. Falls back to the
+ * Win32 console API when VT is unavailable. */
+static void clear_screen(void)
+{
+    if (g_vt) {
+        fputs("\x1b[H\x1b[2J\x1b[3J", stdout);
+        fflush(stdout);
+        return;
+    }
+
+    HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
+    CONSOLE_SCREEN_BUFFER_INFO csbi;
+    if (!GetConsoleScreenBufferInfo(h, &csbi)) return;
+
+    DWORD cells = (DWORD)csbi.dwSize.X * csbi.dwSize.Y;
+    COORD home = {0, 0};
+    DWORD written;
+    FillConsoleOutputCharacterA(h, ' ', cells, home, &written);
+    FillConsoleOutputAttribute(h, csbi.wAttributes, cells, home, &written);
+    SetConsoleCursorPosition(h, home);
+}
+
 /* Interactive read-eval-print loop: each entered line is sent as one batch. */
 static void run_repl(SSL *ssl, SOCKET s)
 {
@@ -1354,7 +1548,9 @@ static void run_repl(SSL *ssl, SOCKET s)
     DWORD timeout = 60000;
     setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&timeout, sizeof(timeout));
 
-    printf("\ntdsh interactive — enter T-SQL and press Enter. Type 'exit' or 'quit' to leave.\n");
+    printf("\ntdsh interactive — enter T-SQL and press Enter.\n"
+           "  \\x   toggle expanded display    \\clear   clear screen    "
+           "exit / quit   leave\n");
     for (;;) {
         printf("tdsh> ");
         fflush(stdout);
@@ -1364,6 +1560,15 @@ static void run_repl(SSL *ssl, SOCKET s)
         while (n && (line[n - 1] == '\n' || line[n - 1] == '\r')) line[--n] = '\0';
         if (n == 0) continue;
         if (strcmp(line, "exit") == 0 || strcmp(line, "quit") == 0) break;
+        if (strcmp(line, "\\x") == 0) {                 /* toggle expanded display */
+            g_expanded = !g_expanded;
+            printf("Expanded display is %s.\n", g_expanded ? "on" : "off (auto)");
+            continue;
+        }
+        if (strcmp(line, "\\clear") == 0 || strcmp(line, "\\cls") == 0) {
+            clear_screen();                             /* wipe screen, keep only the prompt */
+            continue;
+        }
 
         tds_exec(ssl, s, line);
     }
@@ -1375,6 +1580,18 @@ static void run_repl(SSL *ssl, SOCKET s)
 
 int main(int argc, char *argv[])
 {
+  SetConsoleOutputCP(CP_UTF8);   /* render UTF-8 result data (Turkish etc.) correctly */
+
+  /* enable ANSI escape processing so \clear can wipe the scrollback, not just
+   * scroll it out of view (keeps memory/clutter from piling up). */
+  {
+      HANDLE hout = GetStdHandle(STD_OUTPUT_HANDLE);
+      DWORD mode;
+      if (GetConsoleMode(hout, &mode) &&
+          SetConsoleMode(hout, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING))
+          g_vt = 1;
+  }
+
   if (argc < 6) {
       printf("Usage: %s <host> <port> <username> <password> <database>\n", argv[0]);
       return 1;
