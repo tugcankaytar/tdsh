@@ -26,6 +26,8 @@
 /* ---- Constants ---- */
 #define RECV_BUFLEN      16384
 #define TLS_BUFLEN       4096
+#define LOGIN7_BUFLEN    512    /* max size of a LOGIN7 packet body we build */
+#define U16_FIELD_MAX    1024   /* max chars (incl. null) per UTF-16LE field buffer */
 
 #define TDS_PKT_PRELOGIN 0x12   /* pre-login and TLS-handshake packets are wrapped with this type */
 #define TDS_PKT_LOGIN7   0x10   /* Login7 packet type */
@@ -109,13 +111,15 @@ static unsigned char LOGIN7_HEADER[] = {
 /* ============================================================
  *  ASCII -> UTF-16LE
  * ============================================================ */
-void ascii_to_utf16le(const char *ascii_str, uint16_t *utf16_str) {
-    while (*ascii_str != '\0') {
-        *utf16_str = (uint16_t)(*ascii_str);
-        ascii_str++;
-        utf16_str++;
+/* cap = capacity of utf16_str in uint16_t units (including the null terminator).
+ * Never writes past cap; the result is always null-terminated. */
+void ascii_to_utf16le(const char *ascii_str, uint16_t *utf16_str, size_t cap) {
+    size_t i = 0;
+    while (ascii_str[i] != '\0' && i + 1 < cap) {
+        utf16_str[i] = (uint16_t)(unsigned char)ascii_str[i];
+        i++;
     }
-    *utf16_str = 0x0000; // Null-terminate the UTF-16LE string
+    utf16_str[i] = 0x0000; // Null-terminate the UTF-16LE string
 }
 
 /* ============================================================
@@ -346,20 +350,97 @@ static int tds_tls_handshake(SSL *ssl, SOCKET s, unsigned char *recvbuf, int rec
     }
 }
 
+/* Decodes and prints a TDS ERROR (0xAA) token so the user sees WHY login failed.
+ * p points at the token body (right after the 2-byte length); len is that length.
+ * Body layout (MS-TDS 2.2.7.10): Number(4) State(1) Class(1) then MsgText as a
+ * US_VARCHAR (2-byte char count + UTF-16LE chars). */
+static void print_error_token(const unsigned char *p, int len)
+{
+    int off = 4 + 1 + 1;                 /* skip Number, State, Class */
+    if (off + 2 > len) return;
+    int msg_chars = p[off] | (p[off + 1] << 8);
+    off += 2;
+    if (off + msg_chars * 2 > len)       /* clamp defensively */
+        msg_chars = (len - off) / 2;
+
+    printf("server error: ");
+    for (int i = 0; i < msg_chars; i++) {
+        uint16_t c = p[off + i * 2] | (p[off + i * 2 + 1] << 8);
+        putchar(c < 0x80 ? (char)c : '?');   /* ASCII-print; non-ASCII -> '?' */
+    }
+    printf("\n");
+}
+
+/* Walks the TDS token stream of a login response and reports success/failure.
+ * Returns 0 if a LOGINACK (0xAD) token is present, -1 otherwise.
+ *
+ * Token length classes (MS-TDS 2.2.3): variable-length tokens — including
+ * LOGINACK, ERROR, INFO, ENVCHANGE — are identified by (type & 0x30) == 0x20
+ * and carry a 2-byte (USHORT) length prefix. DONE/DONEPROC/DONEINPROC are
+ * fixed 12-byte bodies under TDS 7.2 (Status 2 + CurCmd 2 + RowCount 8).
+ * Anything else we can't safely skip, so we stop. */
+static int parse_login_response(const unsigned char *tok, int tok_len)
+{
+    int i = 0, login_ok = 0;
+
+    while (i < tok_len) {
+        unsigned char type = tok[i++];
+
+        if ((type & 0x30) == 0x20) {             /* variable-length token */
+            if (i + 2 > tok_len) break;
+            int len = tok[i] | (tok[i + 1] << 8);
+            i += 2;
+            if (len > tok_len - i)               /* clamp to what we actually have */
+                len = tok_len - i;
+
+            if (type == 0xAD)        login_ok = 1;              /* LOGINACK */
+            else if (type == 0xAA)   print_error_token(tok + i, len); /* ERROR */
+
+            i += len;
+        } else if (type == 0xFD || type == 0xFE || type == 0xFF) {
+            i += 12;                             /* DONE / DONEPROC / DONEINPROC */
+        } else {
+            dbg("unknown token 0x%02X at offset %d, stopping parse\n", type, i - 1);
+            break;
+        }
+    }
+
+    if (!login_ok)
+        printf("no LOGINACK in response — login failed\n");
+    return login_ok ? 0 : -1;
+}
+
 /* Builds and sends a LOGIN7 packet, then confirms the LOGINACK token.
  * Returns 0 on successful login, -1 otherwise. */
 static int Login7(SSL *ssl, SOCKET s, unsigned char *recvbuf, int recvbuflen,
                   const char *username, const char *password, const char *database) {
-  uint16_t u16_username[1024];
-  uint16_t u16_password[1024];
-  uint16_t u16_database[1024];
+  size_t ulen = strlen(username);
+  size_t plen = strlen(password);
+  size_t dlen = strlen(database);
 
-  ascii_to_utf16le(username, u16_username);
-  ascii_to_utf16le(password, u16_password);
-  ascii_to_utf16le(database, u16_database);
+  /* Bounds check 1: each field must fit its UTF-16LE buffer (incl. null). */
+  if (ulen >= U16_FIELD_MAX || plen >= U16_FIELD_MAX || dlen >= U16_FIELD_MAX) {
+      printf("username/password/database too long (max %d chars each)\n",
+             U16_FIELD_MAX - 1);
+      return -1;
+  }
+  /* Bounds check 2: header (36) + offset table (58) + field data must fit login7[].
+   * data starts at offset 94; each char is 2 bytes. */
+  if (94 + (ulen + plen + dlen) * 2 > LOGIN7_BUFLEN) {
+      printf("credentials too large for LOGIN7 buffer (%d bytes)\n", LOGIN7_BUFLEN);
+      return -1;
+  }
 
-  int user_bytes = strlen(username) * 2;
-  int pass_bytes = strlen(password) * 2;
+  uint16_t u16_username[U16_FIELD_MAX];
+  uint16_t u16_password[U16_FIELD_MAX];
+  uint16_t u16_database[U16_FIELD_MAX];
+
+  ascii_to_utf16le(username, u16_username, U16_FIELD_MAX);
+  ascii_to_utf16le(password, u16_password, U16_FIELD_MAX);
+  ascii_to_utf16le(database, u16_database, U16_FIELD_MAX);
+
+  int user_bytes = (int)(ulen * 2);
+  int pass_bytes = (int)(plen * 2);
 
   dbg("username (UTF-16LE): ");
   for (int i = 0; i < user_bytes; i++)
@@ -374,7 +455,7 @@ static int Login7(SSL *ssl, SOCKET s, unsigned char *recvbuf, int recvbuflen,
       dbg("%02X ", ((uint8_t*)u16_password)[i]);
   dbg("\n");
 
-  unsigned char login7[512];
+  unsigned char login7[LOGIN7_BUFLEN];
   memset(login7, 0, sizeof(login7));   // zero first, leave no garbage
   int data_pos = 94;   // first data offset: 36 (fixed header) + 58 (offset table)
   memcpy(login7, LOGIN7_HEADER, sizeof(LOGIN7_HEADER));
@@ -383,15 +464,15 @@ static int Login7(SSL *ssl, SOCKET s, unsigned char *recvbuf, int recvbuflen,
 
   // LOGIN7 expects a fixed field order. We fill UserName, Password, Database;
   // the rest are empty (char_count 0). Order must match the spec.
-  write_field(login7, &table_pos, &data_pos, NULL, 0);                          // HostName (empty)
-  write_field(login7, &table_pos, &data_pos, u16_username, strlen(username));   // UserName
-  write_field(login7, &table_pos, &data_pos, u16_password, strlen(password));   // Password
-  write_field(login7, &table_pos, &data_pos, NULL, 0);                          // AppName (empty)
-  write_field(login7, &table_pos, &data_pos, NULL, 0);                          // ServerName (empty)
+  write_field(login7, &table_pos, &data_pos, NULL, 0);                        // HostName (empty)
+  write_field(login7, &table_pos, &data_pos, u16_username, (int)ulen);        // UserName
+  write_field(login7, &table_pos, &data_pos, u16_password, (int)plen);        // Password
+  write_field(login7, &table_pos, &data_pos, NULL, 0);                        // AppName (empty)
+  write_field(login7, &table_pos, &data_pos, NULL, 0);                        // ServerName (empty)
   write_field(login7, &table_pos, &data_pos, NULL, 0);  // Unused/Extension
   write_field(login7, &table_pos, &data_pos, NULL, 0);  // CltIntName
   write_field(login7, &table_pos, &data_pos, NULL, 0);  // Language
-  write_field(login7, &table_pos, &data_pos, u16_database, strlen(database));  // Database
+  write_field(login7, &table_pos, &data_pos, u16_database, (int)dlen);        // Database
   memset(login7 + table_pos, 0, 6);  // ClientID (6-byte MAC) — written directly
   table_pos += 6;
   write_field(login7, &table_pos, &data_pos, NULL, 0);  // SSPI
@@ -415,7 +496,7 @@ static int Login7(SSL *ssl, SOCKET s, unsigned char *recvbuf, int recvbuflen,
   login7[3] = (data_pos >> 24) & 0xFF;
 
   // wrap the login7 body in a TDS packet (header goes INSIDE the TLS payload)
-  unsigned char tds_login[512];
+  unsigned char tds_login[TDS_HEADER_LEN + LOGIN7_BUFLEN];
   tds_build_header(tds_login, TDS_PKT_LOGIN7, data_pos);
   memcpy(tds_login + TDS_HEADER_LEN, login7, data_pos);
   int tds_total = TDS_HEADER_LEN + data_pos;
@@ -445,16 +526,8 @@ static int Login7(SSL *ssl, SOCKET s, unsigned char *recvbuf, int recvbuflen,
       dbg("%02X ", tok[i]);
   dbg("\n");
 
-  // scan for LOGINACK (0xAD) — its presence means login succeeded
-  int login_ok = 0;
-  for (int i = 0; i < tok_len; i++) {
-      if (tok[i] == 0xAD) { login_ok = 1; break; }
-  }
-  if (!login_ok) {
-      printf("no LOGINACK in response — login failed\n");
-      return -1;
-  }
-  return 0;
+  // walk the token stream; confirms LOGINACK and surfaces any ERROR message
+  return parse_login_response(tok, tok_len);
 }
 
 /* ============================================================
