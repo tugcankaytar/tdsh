@@ -23,10 +23,12 @@ byte, not to ship a production driver.
    password obfuscated with the TDS nibble-swap + XOR 0xA5 scheme.
 5. Parses the login response by walking the **token stream** and confirms a
    **LOGINACK** token (surfacing the server's message if an ERROR token appears).
-6. Drops into an **interactive REPL**: each line you type is sent as a
-   **SQL batch** (`0x01` packet), the response is reassembled across TDS packets,
-   its **result token stream** is parsed (`COLMETADATA` → `ROW`/`NBCROW` → `DONE`),
-   and rows are printed as an **aligned table**.
+6. Drops into an **interactive REPL** with a small line editor (command history,
+   arrow-key cursor editing): you type T-SQL across as many lines as you like and
+   a standalone **`GO`** sends the buffered **SQL batch** (`0x01` packet). The
+   response is reassembled across TDS packets, its **result token stream** is
+   parsed (`COLMETADATA` → `ROW`/`NBCROW` → `DONE`), and rows are printed as an
+   **aligned table** (or exported to CSV/TSV).
 
 ## Build
 
@@ -34,8 +36,11 @@ Requires a C compiler, OpenSSL, and (on Windows) Winsock. Developed with MSYS2
 UCRT64 on Windows.
 
 ```
-gcc -Wall tdsh.c -o tdsh.exe -lws2_32 -lssl -lcrypto
+gcc -Wall *.c -o tdsh.exe -lws2_32 -lssl -lcrypto
 ```
+
+The sources are split into modules (`tds.c`, `format.c`, `render.c`, `repl.c`,
+`main.c`) sharing one header (`tdsh.h`), so `*.c` compiles the whole client.
 
 On Linux the socket layer would use POSIX sockets instead of Winsock (the
 `#ifdef`-guarded part); the TDS/TLS logic is portable.
@@ -52,17 +57,20 @@ Example:
 ./tdsh.exe 192.168.1.50 1433 sa MyPassword master
 ```
 
-After `Login Success` you land in the interactive prompt. Type a T-SQL statement,
-press Enter, and the result comes back as a coloured box table. `\exit` (or `\q`,
-or EOF — `Ctrl+Z` then Enter on Windows) leaves the loop. Every command tdsh
-handles itself starts with a backslash; `\help` lists them.
+After `Login Success` you land in the interactive prompt. Type T-SQL over one or
+more lines and enter **`GO`** on its own line to run the batch; the result comes
+back as a coloured box table. `\exit` (or `\q`, or EOF — `Ctrl+Z` then Enter on
+Windows) leaves the loop. Every command tdsh handles itself starts with a
+backslash; `\help` lists them.
 
 ```
 Login Success
 
-  tdsh interactive — type T-SQL and press Enter, \help for commands.
+  tdsh interactive — type T-SQL, GO to run, \help for commands.
 
-tdsh> SELECT name, database_id FROM sys.databases
+tdsh> SELECT name, database_id
+  ...> FROM sys.databases
+  ...> GO
 ┌────────┬─────────────┐
 │ name   │ database_id │
 ├────────┼─────────────┤
@@ -76,8 +84,12 @@ tdsh> SELECT name, database_id FROM sys.databases
 tdsh> \exit
 ```
 
-Each line is sent as its own batch, so `GO`-style multi-statement buffering is not
-needed — separate statements with `;` within a line if you want several at once.
+Statements accumulate until a standalone `GO`, so multi-line queries read
+naturally (`;` stays a statement separator *inside* the batch, as in SQL Server).
+The prompt has a small **line editor**: ↑/↓ recall previous lines, ←/→/Home/End
+move the cursor, and Backspace/Delete edit in place. When input is redirected
+(scripting) it falls back to plain line reads, so piped `GO`-separated scripts
+still work.
 
 Wide result sets (more columns than fit the terminal) are shown automatically in
 an **expanded** layout — one `column | value` line per field, grouped per record,
@@ -95,36 +107,41 @@ tarih         │ 2024-04-20
 Long result sets are **paged** a screenful at a time (Enter/Space for the next
 page, `q` to stop) so nothing scrolls off unseen.
 
-Meta-commands (all start with `\`): `\help`/`\?` show the command list, `\x`
-toggles expanded display on/off (off = auto), `\pager` toggles paging, `\clear`
-(or `\cls`) clears the screen, `\exit`/`\q` leaves.
+Meta-commands (all start with `\`):
+
+| Command | Action |
+|---|---|
+| `\help`, `\?` | show the command list |
+| `\l` | list databases (`sys.databases`) |
+| `\dt` | list tables |
+| `\dv` | list views |
+| `\dn` | list schemas |
+| `\d <table>` | describe a table's columns |
+| `\timing` | toggle per-batch elapsed time |
+| `\o <file>` | write result sets to a CSV/TSV file (`\o` alone returns to the screen) |
+| `\x` | toggle expanded display (off = auto) |
+| `\pager` | toggle paging |
+| `\clear`, `\cls` | clear the screen |
+| `\exit`, `\q` | leave tdsh |
+
+The catalog commands (`\l`, `\dt`, `\d`, …) are thin wrappers that run canned
+`sys.*` queries and render them like any other result. `\o` picks the delimiter
+from the file extension (`.tsv` → tab, otherwise comma) and quotes fields per
+RFC 4180.
 
 ## How it is structured
 
-The code is one file, split into single-responsibility functions:
+The code is split into modules that share one header (`tdsh.h`, holding the
+protocol constants, the `Column`/`Table` types, the global session flags, and the
+cross-module prototypes):
 
-| Function | Responsibility |
+| Module | Responsibility |
 |---|---|
-| `tcp_connect` | Open the TCP socket |
-| `tds_send_prelogin` | Send pre-login, parse the negotiated encryption mode |
-| `ssl_setup` | Create the OpenSSL context + memory BIOs |
-| `tds_flush_outgoing` | Pull TLS bytes from OpenSSL, wrap in TDS, send (handshake) |
-| `tds_feed_incoming` | Read a TDS packet, strip its header, feed TLS into OpenSSL |
-| `tds_tls_handshake` | Drive `SSL_connect` by hand across the BIO bridge |
-| `tds_send_app_data` | Send post-handshake data (TDS header already inside the TLS payload) |
-| `write_field` | Write one LOGIN7 offset/length pair and its UTF-16LE data |
-| `ascii_to_utf16le` | Convert a string to UTF-16LE (bounds-checked) |
-| `apply_transform_utf16le` | TDS password obfuscation (nibble-swap + XOR 0xA5) |
-| `Login7` | Build the LOGIN7 packet and authenticate |
-| `parse_login_response` | Walk the login token stream, confirm LOGINACK, print ERROR |
-| `tds_send_message` | Frame a message into TDS packets and send (TLS or plaintext) |
-| `tds_read_message` | Reassemble a full TDS message across packets (TLS or plaintext) |
-| `parse_type_info` | Decode a column's `TYPE_INFO` from `COLMETADATA` |
-| `read_cell` | Read one row value (all length encodings incl. PLP/text) |
-| `format_cell` | Format a raw value as text (ints, decimal, dates, strings, …) |
-| `parse_result_stream` | Walk the result token stream and render tables |
-| `tds_exec` | Send a T-SQL batch and print the result |
-| `run_repl` | Interactive read-eval-print loop |
+| `tds.c` | TCP connect; pre-login; TLS-in-TDS handshake; `LOGIN7`; TDS packet framing/reassembly (`tds_send_message`/`tds_read_message`); low-level LE + socket I/O |
+| `format.c` | `TYPE_INFO` decode (`parse_type_info`), row-value reading (`read_cell`) and text formatting (`format_cell`), UTF-16/ANSI → UTF-8 |
+| `render.c` | display-width math, coloured box tables, expanded layout, screenful pager, CSV/TSV export, and the result token-stream walk (`parse_result_stream`) |
+| `repl.c` | batch execution (`tds_exec`), `GO` buffering, meta-commands, the line editor + history, the REPL, and the connection form |
+| `main.c` | orchestration (connect → pre-login → TLS → login → REPL) and the global definitions |
 
 ## Result-set support
 
@@ -173,7 +190,8 @@ This is intentionally minimal and lab-oriented:
   decoded from UTF-16LE; legacy single-byte `(var)char`/`text` is decoded via
   the system ANSI code page (Windows-1254 on a Turkish system) — best-effort
   when the column's collation differs from the system default. The SQL text you
-  type is assumed ASCII.
+  type is converted from UTF-8 to UTF-16LE before it is sent, so non-ASCII
+  literals survive the round trip.
 - **Tables adapt to the terminal.** Column widths are measured in display
   columns (UTF-8 aware); over-long cells are truncated with an ellipsis (`…`)
   and numeric columns are right-justified. When a grid would be wider than the
@@ -183,9 +201,22 @@ This is intentionally minimal and lab-oriented:
 
 ## What's next
 
-- Multi-line statement buffering (a `GO`-style terminator).
-- Session encryption support (`ENCRYPT_ON`) for the query path.
-- Deriving the exact varchar code page from the column collation.
+Done recently: modular source layout, multi-line `GO` batching, a history +
+arrow-key line editor, `\l`/`\dt`/`\d`/`\dn`/`\dv` catalog commands, `\timing`,
+and `\o` CSV/TSV export.
+
+Still on the roadmap:
+
+- **Wide-glyph width** (a `wcwidth`-style table) so CJK/double-width characters
+  don't skew table alignment.
+- **Deriving the exact varchar code page** from the column collation instead of
+  the system ANSI default.
+- **Streaming render** for very large result sets instead of buffering to the
+  100,000-row cap.
+- **Informational tokens** (`INFO` 0xAB — `PRINT` output, rows-affected messages).
+- **POSIX/Linux port** (Winsock → BSD sockets, `_getch` → termios).
+- **Integrated Windows auth** (SSPI/NTLM) alongside SQL login.
+- **Connection resilience** (keep-alive, timeouts, reconnect on a dropped link).
 
 ## Why
 
