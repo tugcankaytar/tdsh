@@ -125,35 +125,17 @@ static int codepage_from_collation(const unsigned char *col)
     unsigned int lcid = v & 0xFFFFF;                 /* low 20 bits = LCID */
     unsigned char sortid = col[4];
 
-    if (sortid != 0) {                               /* SQL collation */
-        int cp = sortid_codepage(sortid);
-        return cp ? cp : CP_ACP;
-    }
-    /* Windows collation: ask the OS for the locale's default ANSI code page. */
-    char buf[16];
-    if (GetLocaleInfoA(MAKELCID(lcid, SORT_DEFAULT),
-                       LOCALE_IDEFAULTANSICODEPAGE, buf, sizeof buf)) {
-        int cp = atoi(buf);
-        if (cp > 0) return cp;
-    }
-    return CP_ACP;
+    if (sortid != 0)                                 /* SQL collation */
+        return sortid_codepage(sortid);              /* 0 -> system default downstream */
+    return plat_lcid_codepage(lcid);                 /* Windows collation: locale ANSI CP */
 }
 
 /* Single-byte (collation codepage) bytes -> UTF-8. Uses the column's own code
- * page (derived from its collation) when known, else the system ANSI codepage.
+ * page (derived from its collation) when known, else the system default.
  * Best-effort for legacy varchar/char. */
 static void utf8_from_ansi(int codepage, const unsigned char *v, int n, char *out, int outcap)
 {
-    UINT cp = codepage > 0 ? (UINT)codepage : CP_ACP;
-    wchar_t wbuf[CELL_MAX];
-    int wn = MultiByteToWideChar(cp, 0, (const char *)v, n, wbuf, CELL_MAX);
-    if (wn <= 0) {                                   /* fallback: copy raw bytes */
-        int cpy = n < outcap - 1 ? n : outcap - 1;
-        memcpy(out, v, cpy); out[cpy] = '\0'; return;
-    }
-    int bn = WideCharToMultiByte(CP_UTF8, 0, wbuf, wn, out, outcap - 1, NULL, NULL);
-    if (bn < 0) bn = 0;
-    out[bn] = '\0';
+    plat_ansi_to_utf8(codepage, v, n, out, outcap);
 }
 
 /* Formats one non-null value (raw bytes v[0..n)) into a text cell. */

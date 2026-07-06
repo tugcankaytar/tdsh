@@ -12,17 +12,7 @@ int g_pager    = 1;
 
 int main(int argc, char *argv[])
 {
-  SetConsoleOutputCP(CP_UTF8);   /* render UTF-8 result data (Turkish etc.) correctly */
-
-  /* enable ANSI escape processing so \clear can wipe the scrollback, not just
-   * scroll it out of view (keeps memory/clutter from piling up). */
-  {
-      HANDLE hout = GetStdHandle(STD_OUTPUT_HANDLE);
-      DWORD mode;
-      if (GetConsoleMode(hout, &mode) &&
-          SetConsoleMode(hout, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING))
-          g_vt = 1;
-  }
+  plat_console_init();   /* UTF-8 output + ANSI/VT processing; sets g_vt */
 
   /* Connection details. Filled either from the command line (backward-compatible
    * scripting mode) or, when no args are given, asked interactively as a form. */
@@ -42,11 +32,7 @@ int main(int argc, char *argv[])
       return 1;
   }
 
-  WSADATA wsaData;
-  if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
-      printf("WSAStartup failed\n");
-      return 1;
-  }
+  if (plat_net_init() != 0) return 1;
 
   int rc = 1;                 /* exit code; set to 0 on success */
   SOCKET s     = INVALID_SOCKET;
@@ -78,6 +64,6 @@ cleanup:
   if (ssl) { SSL_shutdown(ssl); SSL_free(ssl); }  /* BIOs are freed together with ssl */
   if (ctx) SSL_CTX_free(ctx);
   if (s != INVALID_SOCKET) closesocket(s);
-  WSACleanup();
+  plat_net_cleanup();
   return rc;
 }

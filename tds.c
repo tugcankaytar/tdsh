@@ -127,7 +127,7 @@ static void write_field(unsigned char *login7,
 SOCKET tcp_connect(const char *host, const char *port)
 {
     struct addrinfo hints, *result = NULL;
-    ZeroMemory(&hints, sizeof(hints));
+    memset(&hints, 0, sizeof(hints));
     hints.ai_family   = AF_INET;        /* IPv4 only — avoids the IPv6 surprise */
     hints.ai_socktype = SOCK_STREAM;
     hints.ai_protocol = IPPROTO_TCP;
@@ -507,8 +507,7 @@ int Login7(SSL *ssl, SOCKET s,
   dbg("tds_send_app_data returned: %d\n", sent);
   if (sent <= 0) { printf("login7 could not be sent\n"); return -1; }
 
-  DWORD timeout = 15000;
-  setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout));
+  plat_set_recv_timeout(s, 15000);
 
   // Read the login response through the transport the session uses: TLS when
   // encryption is ON, plaintext when the server encrypts the login only.

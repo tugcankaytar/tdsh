@@ -16,19 +16,9 @@
 #ifndef TDSH_H
 #define TDSH_H
 
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
+#include "platform.h"   /* OS abstraction: sockets, console, keystrokes, conversions */
 
-#include <windows.h>
-#include <winsock2.h>
-#include <ws2tcpip.h>
-#include <stdio.h>
-#include <stdint.h>
-#include <stdlib.h>
-#include <string.h>
-#include <ctype.h>    /* isspace/tolower — meta-command + GO parsing */
-#include <conio.h>    /* _getch — read password/editor keystrokes without echo */
+#include <ctype.h>      /* isspace/tolower — meta-command + GO parsing */
 
 #include <openssl/ssl.h>
 #include <openssl/err.h>
@@ -148,7 +138,6 @@ int  read_bvarchar_name(const unsigned char *p, int avail, char *name, int namec
 
 /* render.c */
 void parse_result_stream(const unsigned char *tok, int len);
-int  is_console(void);
 
 /* repl.c */
 void run_repl(SSL *ssl, SOCKET s);

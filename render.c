@@ -123,35 +123,7 @@ static void print_padded(const char *s, int width, int right)
     }
 }
 
-/* Terminal width in columns (falls back to 80 when output is not a console). */
-static int term_width(void)
-{
-    CONSOLE_SCREEN_BUFFER_INFO csbi;
-    if (GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), &csbi)) {
-        int w = csbi.srWindow.Right - csbi.srWindow.Left + 1;
-        if (w > 0) return w;
-    }
-    return 80;
-}
-
-/* Visible terminal height in rows (falls back to 24 when not a console). */
-static int term_height(void)
-{
-    CONSOLE_SCREEN_BUFFER_INFO csbi;
-    if (GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), &csbi)) {
-        int h = csbi.srWindow.Bottom - csbi.srWindow.Top + 1;
-        if (h > 0) return h;
-    }
-    return 24;
-}
-
-/* True when stdout is a real console (not redirected to a file/pipe). Paging is
- * only meaningful — and only able to read a keypress — on an interactive TTY. */
-int is_console(void)
-{
-    CONSOLE_SCREEN_BUFFER_INFO csbi;
-    return GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), &csbi) != 0;
-}
+/* term_width / term_height / is_console live in platform.c (OS-specific). */
 
 /* ---- screenful pager ------------------------------------------------------
  * Renderers emit content lines and call pager_step() after each one. When a

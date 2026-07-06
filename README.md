@@ -53,12 +53,19 @@ Requires a C compiler, OpenSSL, and (on Windows) Winsock. Developed with **MSYS2
 UCRT64** on Windows 11.
 
 ```sh
+# Windows (MSYS2 UCRT64)
 gcc -Wall *.c -o tdsh.exe -lws2_32 -lssl -lcrypto
+
+# Linux / Unix
+gcc -Wall *.c -o tdsh -lssl -lcrypto        # add -lrt on very old glibc
 ```
 
 The sources are split into modules that share a single header (`tdsh.h`), so
-`*.c` compiles the whole client. On Linux the socket layer would swap Winsock for
-POSIX sockets (the `#ifdef`-guarded part); the TDS and TLS logic is portable.
+`*.c` compiles the whole client. OS-specific code (Winsock vs BSD sockets,
+console vs termios, the codepage conversions) lives behind a `platform.c`/`.h`
+abstraction, guarded by `#ifdef _WIN32`. Windows is the verified target; the
+POSIX branch is written to standard APIs but has not yet been built on a Linux
+box.
 
 > **Tip:** on Windows the link step fails if a `tdsh.exe` is still running (the
 > file is locked). Close it first.
@@ -183,6 +190,7 @@ cross-module prototypes):
 | `format.c` | `TYPE_INFO` decode, row-value reading, value → text formatting, UTF-16/ANSI → UTF-8 |
 | `render.c` | display-width math, coloured box tables, expanded layout, pager, CSV/TSV export, and the result token-stream walk |
 | `repl.c` | batch execution, `GO` buffering, meta-commands, the line editor + history, and the connection form |
+| `platform.c` | OS abstraction: sockets init, console/terminal size, raw keystrokes, monotonic clock, and text conversions (Windows + POSIX) |
 | `main.c` | orchestration (connect → pre-login → TLS → login → REPL) and the global definitions |
 
 ### Result-set support
@@ -248,7 +256,8 @@ pages derived from the column collation, `INFO`/`PRINT` messages plus
 
 Still ahead:
 
-- **POSIX/Linux port** (Winsock → BSD sockets, `_getch` → termios).
+- **POSIX/Linux port** — the `platform.c` abstraction is in place and the POSIX
+  branch is written; it still needs to be compiled and exercised on Linux.
 - **Integrated Windows auth** (SSPI/NTLM) alongside SQL login.
 - **Connection resilience** (keep-alive, timeouts, reconnect on a dropped link).
 

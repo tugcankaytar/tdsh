@@ -17,7 +17,6 @@ static int g_timing = 0;
 /* forward declarations for helpers defined further down */
 static int  tds_exec(SSL *ssl, SOCKET s, const char *sql);
 static void run_batch(SSL *ssl, SOCKET s, const char *sql);
-static void clear_screen(void);
 static void print_repl_help(void);
 static int  handle_meta(SSL *ssl, SOCKET s, char *line);
 static int  read_line_edit(const char *prompt, char *buf, int cap);
@@ -28,14 +27,13 @@ static void hist_push(const char *line);
 static int tds_exec(SSL *ssl, SOCKET s, const char *sql)
 {
     /* The batch text arrives as UTF-8 (console output CP + editor input); convert
-     * it to UTF-16LE properly so multi-byte characters survive, not just ASCII. */
-    int wn = MultiByteToWideChar(CP_UTF8, 0, sql, -1, NULL, 0);   /* incl. null */
-    if (wn <= 0) wn = 1;
-    int wchars = wn - 1;                           /* UTF-16 code units, sans null */
+     * it to UTF-16LE so multi-byte characters survive, not just ASCII. */
+    unsigned char *u16 = NULL;
+    int wchars = plat_utf8_to_utf16le(sql, &u16);  /* UTF-16 code units */
 
     int msglen = 22 + wchars * 2;                  /* ALL_HEADERS(22) + UTF-16LE text */
     unsigned char *msg = malloc(msglen > 22 ? msglen : 22);
-    if (!msg) return -1;
+    if (!msg) { free(u16); return -1; }
 
     /* ALL_HEADERS with a single Transaction Descriptor header (required by TDS 7.2+) */
     put_u32le(msg + 0, 22);                        /* TotalLength (incl. itself) */
@@ -44,16 +42,8 @@ static int tds_exec(SSL *ssl, SOCKET s, const char *sql)
     memset(msg + 10, 0, 8);                        /* TransactionDescriptor = 0 */
     put_u32le(msg + 18, 1);                        /* OutstandingRequestCount = 1 */
 
-    if (wchars > 0) {
-        wchar_t *wbuf = malloc((size_t)wn * sizeof(wchar_t));
-        if (!wbuf) { free(msg); return -1; }
-        MultiByteToWideChar(CP_UTF8, 0, sql, -1, wbuf, wn);
-        for (int k = 0; k < wchars; k++) {         /* UTF-16 host -> little-endian bytes */
-            msg[22 + k * 2]     = (unsigned char)(wbuf[k] & 0xFF);
-            msg[22 + k * 2 + 1] = (unsigned char)((wbuf[k] >> 8) & 0xFF);
-        }
-        free(wbuf);
-    }
+    if (wchars > 0) memcpy(msg + 22, u16, (size_t)wchars * 2);
+    free(u16);
 
     /* Transport follows the negotiated encryption: TLS both ways when the whole
      * session is encrypted, plaintext both ways under ENCRYPT_OFF. */
@@ -70,47 +60,18 @@ static int tds_exec(SSL *ssl, SOCKET s, const char *sql)
     return 0;
 }
 
-/* Runs one batch, timing it when \timing is on (QueryPerformanceCounter). */
+/* Runs one batch, timing it when \timing is on (monotonic clock). */
 static void run_batch(SSL *ssl, SOCKET s, const char *sql)
 {
     if (!g_timing) { tds_exec(ssl, s, sql); return; }
 
-    LARGE_INTEGER freq, a, b;
-    QueryPerformanceFrequency(&freq);
-    QueryPerformanceCounter(&a);
+    double a = plat_now_ms();
     tds_exec(ssl, s, sql);
-    QueryPerformanceCounter(&b);
-
-    double ms = (double)(b.QuadPart - a.QuadPart) * 1000.0 / (double)freq.QuadPart;
-    printf("%sTime: %.3f ms%s\n\n", CLR_DIM, ms, CLR_RESET);
+    double b = plat_now_ms();
+    printf("%sTime: %.3f ms%s\n\n", CLR_DIM, b - a, CLR_RESET);
 }
 
-/* Clears the console. When ANSI/VT processing is available (Windows Terminal,
- * modern conhost) it also wipes the scrollback so old output is truly gone and
- * does not accumulate. Order matters: ESC[H homes the cursor, ESC[2J clears the
- * screen (which pushes the current viewport into the scrollback on Windows
- * Terminal), and ESC[3J must come LAST so it erases that pushed content too —
- * otherwise the first \clear leaves the old lines behind. Falls back to the
- * Win32 console API when VT is unavailable. */
-static void clear_screen(void)
-{
-    if (g_vt) {
-        fputs("\x1b[H\x1b[2J\x1b[3J", stdout);
-        fflush(stdout);
-        return;
-    }
-
-    HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
-    CONSOLE_SCREEN_BUFFER_INFO csbi;
-    if (!GetConsoleScreenBufferInfo(h, &csbi)) return;
-
-    DWORD cells = (DWORD)csbi.dwSize.X * csbi.dwSize.Y;
-    COORD home = {0, 0};
-    DWORD written;
-    FillConsoleOutputCharacterA(h, ' ', cells, home, &written);
-    FillConsoleOutputAttribute(h, csbi.wAttributes, cells, home, &written);
-    SetConsoleCursorPosition(h, home);
-}
+/* clear_screen lives in platform.c (OS-specific). */
 
 /* Lists the backslash meta-commands. All of tdsh's own commands start with '\';
  * anything else is buffered and sent to the server as a T-SQL batch on GO. */
@@ -382,8 +343,7 @@ void run_repl(SSL *ssl, SOCKET s)
     batch[0] = '\0';
 
     /* let queries take their time; login used a short recv timeout */
-    DWORD timeout = 60000;
-    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&timeout, sizeof(timeout));
+    plat_set_recv_timeout(s, 60000);
 
     printf("\n  %s%stdsh%s %sinteractive%s — type T-SQL, %sGO%s to run, "
            "%s\\help%s for commands.\n\n",
