@@ -96,12 +96,57 @@ void utf8_from_utf16le(const unsigned char *v, int nbytes, char *out, int outcap
     out[j] = '\0';
 }
 
-/* Single-byte (collation codepage) bytes -> UTF-8, via the system ANSI codepage
- * (Windows-1254 on a Turkish system). Best-effort for legacy varchar/char. */
-static void utf8_from_ansi(const unsigned char *v, int n, char *out, int outcap)
+/* Maps a SQL-collation SortId to its Windows code page. Covers the common
+ * OEM/ANSI sort orders; unknown ids fall back to the system default (0). */
+static int sortid_codepage(unsigned char sid)
 {
+    switch (sid) {
+    case 30: return 437;                                     /* CP437 (US OEM) */
+    case 31: case 32: case 33: case 34: case 40: case 41:
+    case 42: case 43: case 44: case 49: case 55: case 56:
+    case 57: case 58: case 59: case 60: case 61: return 850; /* CP850 (multilingual OEM) */
+    case 51: case 52: case 53: case 54: case 71: case 72:
+    case 73: case 74: return 1252;                           /* CP1252 (Latin1) */
+    case 80: case 81: case 82: case 83: case 84: case 87:
+    case 88: case 89: case 90: case 91: return 1250;         /* CP1250 (Central Eur.) */
+    case 105: case 106: case 107: case 108: return 1251;     /* CP1251 (Cyrillic) */
+    case 113: case 114: case 121: case 124: return 1253;     /* CP1253 (Greek) */
+    case 128: case 129: case 130: return 1254;               /* CP1254 (Turkish) */
+    default: return 0;                                       /* unknown -> system default */
+    }
+}
+
+/* Derives the code page for a legacy (var)char column from its 5-byte collation.
+ * Windows collations (SortId 0) carry an LCID whose ANSI code page the OS knows;
+ * SQL collations (SortId != 0) select the code page by sort id. */
+static int codepage_from_collation(const unsigned char *col)
+{
+    unsigned int v = col[0] | (col[1] << 8) | (col[2] << 16) | ((unsigned)col[3] << 24);
+    unsigned int lcid = v & 0xFFFFF;                 /* low 20 bits = LCID */
+    unsigned char sortid = col[4];
+
+    if (sortid != 0) {                               /* SQL collation */
+        int cp = sortid_codepage(sortid);
+        return cp ? cp : CP_ACP;
+    }
+    /* Windows collation: ask the OS for the locale's default ANSI code page. */
+    char buf[16];
+    if (GetLocaleInfoA(MAKELCID(lcid, SORT_DEFAULT),
+                       LOCALE_IDEFAULTANSICODEPAGE, buf, sizeof buf)) {
+        int cp = atoi(buf);
+        if (cp > 0) return cp;
+    }
+    return CP_ACP;
+}
+
+/* Single-byte (collation codepage) bytes -> UTF-8. Uses the column's own code
+ * page (derived from its collation) when known, else the system ANSI codepage.
+ * Best-effort for legacy varchar/char. */
+static void utf8_from_ansi(int codepage, const unsigned char *v, int n, char *out, int outcap)
+{
+    UINT cp = codepage > 0 ? (UINT)codepage : CP_ACP;
     wchar_t wbuf[CELL_MAX];
-    int wn = MultiByteToWideChar(CP_ACP, 0, (const char *)v, n, wbuf, CELL_MAX);
+    int wn = MultiByteToWideChar(cp, 0, (const char *)v, n, wbuf, CELL_MAX);
     if (wn <= 0) {                                   /* fallback: copy raw bytes */
         int cpy = n < outcap - 1 ? n : outcap - 1;
         memcpy(out, v, cpy); out[cpy] = '\0'; return;
@@ -240,7 +285,7 @@ static void format_cell(const Column *c, const unsigned char *v, int n, char *ou
         return;
     }
     /* single-byte (var)char / text -> UTF-8 via the system ANSI codepage */
-    utf8_from_ansi(v, n, out, outcap);
+    utf8_from_ansi(c->codepage, v, n, out, outcap);
 }
 
 /* Reads one column value out of a ROW at p (avail bytes left), formats it into
@@ -322,6 +367,7 @@ int parse_type_info(const unsigned char *p, int avail, Column *col)
     uint8_t t = p[0]; int i = 1;
     col->type = t; col->scale = 0; col->precision = 0;
     col->is_unicode = 0; col->is_binary = 0; col->max_len = 0; col->fixed_size = 0;
+    col->codepage = 0;
 
     switch (t) {
     /* fixed-length (no metadata, no length prefix in rows) */
@@ -375,7 +421,8 @@ int parse_type_info(const unsigned char *p, int avail, Column *col)
     /* ushort-len char (max-len 2 + 5-byte collation) */
     case 0xA7: case 0xAF:                          /* varchar, char */
         if (avail < i + 2 + 5) return -1;
-        col->max_len = p[i] | (p[i + 1] << 8); i += 2 + 5;
+        col->max_len = p[i] | (p[i + 1] << 8); i += 2;
+        col->codepage = codepage_from_collation(p + i); i += 5;
         col->len_cat = (col->max_len == 0xFFFF) ? LC_PLP : LC_USHORT; break;
     case 0xE7: case 0xEF:                          /* nvarchar, nchar */
         if (avail < i + 2 + 5) return -1;
@@ -386,6 +433,7 @@ int parse_type_info(const unsigned char *p, int avail, Column *col)
     /* long-len: text / ntext / image (max-len 4 [+5 collation] + table name) */
     case 0x23: case 0x63: {                        /* text, ntext */
         if (avail < i + 4 + 5) return -1;
+        if (t == 0x23) col->codepage = codepage_from_collation(p + i + 4);  /* text: collation after max-len */
         i += 4 + 5;
         if (t == 0x63) col->is_unicode = 1;
         if (avail < i + 1) return -1;

@@ -354,6 +354,24 @@ void print_error_token(const unsigned char *p, int len)
            CLR_BOLD, CLR_RED, CLR_RESET, CLR_RED, msg, CLR_RESET);
 }
 
+/* Decodes and prints a TDS INFO (0xAB) token — PRINT output and informational
+ * server messages (e.g. "Changed database context…"). Same body layout as ERROR
+ * (Number(4) State(1) Class(1) then MsgText as a US_VARCHAR); shown dimmed, not
+ * as an error. */
+void print_info_token(const unsigned char *p, int len)
+{
+    int off = 4 + 1 + 1;                 /* skip Number, State, Class */
+    if (off + 2 > len) return;
+    int msg_chars = p[off] | (p[off + 1] << 8);
+    off += 2;
+    if (off + msg_chars * 2 > len)       /* clamp defensively */
+        msg_chars = (len - off) / 2;
+
+    char msg[2048];
+    utf8_from_utf16le(p + off, msg_chars * 2, msg, sizeof msg);
+    printf("%s%s%s\n", CLR_DIM, msg, CLR_RESET);
+}
+
 /* Walks the TDS token stream of a login response and reports success/failure.
  * Returns 0 if a LOGINACK (0xAD) token is present, -1 otherwise.
  *

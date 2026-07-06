@@ -225,9 +225,12 @@ Intentionally minimal and lab-oriented:
   boundaries; the pre-login/handshake path still assumes one packet per `recv`.
 - **Output is UTF-8.** The console output code page is switched to UTF-8;
   `n(var)char`/`ntext` decodes from UTF-16LE and legacy `(var)char`/`text` via the
-  system ANSI code page (best-effort when the column collation differs). SQL text
-  you type is converted UTF-8 → UTF-16LE before sending, so non-ASCII literals
-  survive the round trip.
+  **code page derived from the column's collation** (the OS locale's ANSI code
+  page for Windows collations, a sort-id table for SQL collations), falling back
+  to the system default. SQL text you type is converted UTF-8 → UTF-16LE before
+  sending, so non-ASCII literals survive the round trip. Column widths are
+  measured in true display columns (a `wcwidth`-style table, so CJK/double-width
+  glyphs align).
 - **Rows are buffered before rendering**, capped at 100,000 per result set.
 
 ---
@@ -236,16 +239,13 @@ Intentionally minimal and lab-oriented:
 
 Shipped recently: modular source layout, multi-line `GO` batching, a history +
 arrow-key line editor, the `\l`/`\dt`/`\d`/`\dn`/`\dv` catalog commands,
-`\timing`, and `\o` CSV/TSV export.
+`\timing`, `\o` CSV/TSV export, `wcwidth`-style wide-glyph widths, varchar code
+pages derived from the column collation, and `INFO`/`PRINT` messages plus
+`(N rows affected)`.
 
 Still ahead:
 
-- **Wide-glyph width** (a `wcwidth`-style table) so CJK/double-width characters
-  don't skew table alignment.
-- **Exact varchar code page** derived from the column collation instead of the
-  system ANSI default.
 - **Streaming render** for very large result sets, beyond the 100,000-row buffer.
-- **Informational tokens** (`INFO` `0xAB` — `PRINT` output, rows-affected messages).
 - **POSIX/Linux port** (Winsock → BSD sockets, `_getch` → termios).
 - **Integrated Windows auth** (SSPI/NTLM) alongside SQL login.
 - **Connection resilience** (keep-alive, timeouts, reconnect on a dropped link).

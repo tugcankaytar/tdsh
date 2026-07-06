@@ -110,6 +110,7 @@ typedef struct {
     uint8_t  scale;       /* DECIMAL/NUMERIC, TIME/DATETIME2/DATETIMEOFFSET */
     int      is_unicode;  /* n(var)char / ntext */
     int      is_binary;   /* (var)binary / image */
+    int      codepage;    /* legacy (var)char code page from collation; 0 = system default */
 } Column;
 
 typedef struct {
@@ -133,6 +134,7 @@ int    tds_send_message(SSL *ssl, SOCKET s, int enc, unsigned char type,
 unsigned char *tds_read_message(SSL *ssl, SOCKET s, int enc, int *outlen);
 void   put_u32le(unsigned char *p, uint32_t v);
 void   print_error_token(const unsigned char *p, int len);
+void   print_info_token(const unsigned char *p, int len);
 unsigned long long read_uint_le(const unsigned char *v, int n);
 long long          read_int_le(const unsigned char *v, int n);
 unsigned long long pow10_ull(int e);

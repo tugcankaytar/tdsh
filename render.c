@@ -53,13 +53,64 @@ static void print_repeat(char ch, int n) { for (int i = 0; i < n; i++) putchar(c
 /* Repeat a (possibly multi-byte) glyph string n times — used for box borders. */
 static void print_repeat_s(const char *s, int n) { for (int i = 0; i < n; i++) fputs(s, stdout); }
 
-/* Display width of a UTF-8 string = number of code points (good enough for
- * Latin/Turkish text; wide CJK glyphs are undercounted). */
+/* Decodes one UTF-8 sequence at s into *cp and returns its byte length (>=1).
+ * The short-circuit continuation checks stop at a null or a bad byte, so a
+ * truncated sequence at end-of-string never reads past the terminator. */
+static int utf8_decode(const unsigned char *s, unsigned int *cp)
+{
+    unsigned char c = s[0];
+    if (c < 0x80) { *cp = c; return 1; }
+    if ((c & 0xE0) == 0xC0 && (s[1] & 0xC0) == 0x80) {
+        *cp = ((c & 0x1Fu) << 6) | (s[1] & 0x3Fu); return 2;
+    }
+    if ((c & 0xF0) == 0xE0 && (s[1] & 0xC0) == 0x80 && (s[2] & 0xC0) == 0x80) {
+        *cp = ((c & 0x0Fu) << 12) | ((s[1] & 0x3Fu) << 6) | (s[2] & 0x3Fu); return 3;
+    }
+    if ((c & 0xF8) == 0xF0 && (s[1] & 0xC0) == 0x80 && (s[2] & 0xC0) == 0x80 && (s[3] & 0xC0) == 0x80) {
+        *cp = ((c & 0x07u) << 18) | ((s[1] & 0x3Fu) << 12) | ((s[2] & 0x3Fu) << 6) | (s[3] & 0x3Fu);
+        return 4;
+    }
+    *cp = c; return 1;                               /* invalid lead byte: width-1 */
+}
+
+/* Terminal display width of one code point: 0 for zero-width (combining marks,
+ * joiners, variation selectors), 2 for East-Asian wide / fullwidth / most emoji,
+ * 1 otherwise. A compact wcwidth-style table — enough to keep CJK from skewing
+ * column alignment without pulling in a full Unicode database. */
+static int cp_width(unsigned int cp)
+{
+    if (cp == 0) return 0;
+    if ((cp >= 0x0300 && cp <= 0x036F) ||            /* combining diacritics */
+        (cp >= 0x200B && cp <= 0x200F) ||            /* zero-width space/joiners/marks */
+        (cp >= 0x202A && cp <= 0x202E) ||            /* bidi controls */
+        (cp >= 0xFE00 && cp <= 0xFE0F) ||            /* variation selectors */
+        (cp >= 0xFE20 && cp <= 0xFE2F) ||            /* combining half marks */
+        cp == 0xFEFF)                                /* BOM / ZWNBSP */
+        return 0;
+    if ((cp >= 0x1100 && cp <= 0x115F) ||            /* Hangul Jamo */
+        (cp >= 0x2E80 && cp <= 0x303E) ||            /* CJK radicals … symbols */
+        (cp >= 0x3041 && cp <= 0x33FF) ||            /* Kana … CJK compat */
+        (cp >= 0x3400 && cp <= 0x4DBF) ||            /* CJK Ext A */
+        (cp >= 0x4E00 && cp <= 0x9FFF) ||            /* CJK Unified */
+        (cp >= 0xA000 && cp <= 0xA4CF) ||            /* Yi */
+        (cp >= 0xAC00 && cp <= 0xD7A3) ||            /* Hangul syllables */
+        (cp >= 0xF900 && cp <= 0xFAFF) ||            /* CJK compat ideographs */
+        (cp >= 0xFE10 && cp <= 0xFE19) ||            /* vertical forms */
+        (cp >= 0xFE30 && cp <= 0xFE6F) ||            /* CJK compat forms */
+        (cp >= 0xFF00 && cp <= 0xFF60) ||            /* fullwidth forms */
+        (cp >= 0xFFE0 && cp <= 0xFFE6) ||            /* fullwidth signs */
+        (cp >= 0x1F300 && cp <= 0x1FAFF) ||          /* symbols & emoji */
+        (cp >= 0x20000 && cp <= 0x3FFFD))            /* CJK Ext B+ */
+        return 2;
+    return 1;
+}
+
+/* Display width of a whole UTF-8 string, in terminal columns. */
 static int utf8_ncols(const char *s)
 {
     int n = 0;
-    for (const unsigned char *p = (const unsigned char *)s; *p; p++)
-        if ((*p & 0xC0) != 0x80) n++;                /* count non-continuation bytes */
+    const unsigned char *p = (const unsigned char *)s;
+    while (*p) { unsigned int cp; int len = utf8_decode(p, &cp); n += cp_width(cp); p += len; }
     return n;
 }
 
@@ -69,15 +120,19 @@ static int print_clip(const char *s, int width)
 {
     int dw = utf8_ncols(s);
     if (dw <= width) { fputs(s, stdout); return dw; }
-    int keep = width > 0 ? width - 1 : 0;            /* leave 1 column for the ellipsis */
-    const char *p = s;
-    for (int cps = 0; *p && cps < keep; cps++) {
-        unsigned char c = (unsigned char)*p;
-        p += (c < 0x80) ? 1 : (c < 0xE0) ? 2 : (c < 0xF0) ? 3 : 4;
+
+    int budget = width > 0 ? width - 1 : 0;          /* leave 1 column for the ellipsis */
+    const unsigned char *p = (const unsigned char *)s;
+    int used = 0;
+    while (*p) {
+        unsigned int cp; int len = utf8_decode(p, &cp);
+        int w = cp_width(cp);
+        if (used + w > budget) break;                /* next glyph would overflow */
+        used += w; p += len;
     }
-    fwrite(s, 1, (size_t)(p - s), stdout);
-    fputs("\xE2\x80\xA6", stdout);                   /* … */
-    return width;
+    fwrite(s, 1, (size_t)((const char *)p - s), stdout);
+    fputs("\xE2\x80\xA6", stdout);                   /* … (1 column) */
+    return used + 1;
 }
 
 /* Print s in exactly `width` display columns, right- or left-justified. */
@@ -445,7 +500,17 @@ void parse_result_stream(const unsigned char *tok, int len)
             }
         }
         else if (type == 0xFD || type == 0xFE || type == 0xFF) {  /* DONE / DONEPROC / DONEINPROC */
+            int had_set = (t.ncols > 0);            /* did this statement return a grid? */
             if (t.ncols > 0 || t.nrows > 0) { table_render(&t); table_reset(&t); }
+            if (i + 12 <= len) {
+                int status = tok[i] | (tok[i + 1] << 8);          /* Status(2) */
+                unsigned long long rc = read_uint_le(tok + i + 4, 8);  /* RowCount(8) */
+                if ((status & 0x10) && !had_set) {  /* DONE_COUNT set on a non-result statement */
+                    printf("%s(%llu row%s affected)%s\n\n",
+                           CLR_DIM, rc, rc == 1 ? "" : "s", CLR_RESET);
+                    any_output = 1;
+                }
+            }
             i += 12;                                /* Status(2) + CurCmd(2) + RowCount(8) */
         }
         else if (type == 0x79) {                   /* RETURNSTATUS */
@@ -455,7 +520,8 @@ void parse_result_stream(const unsigned char *tok, int len)
             if (i + 2 > len) break;
             int tl = tok[i] | (tok[i + 1] << 8); i += 2;
             if (tl > len - i) tl = len - i;
-            if (type == 0xAA) print_error_token(tok + i, tl);   /* ERROR — show message */
+            if (type == 0xAA) print_error_token(tok + i, tl);        /* ERROR — show message */
+            else if (type == 0xAB) { print_info_token(tok + i, tl); any_output = 1; }  /* INFO/PRINT */
             i += tl;
         }
         else {
