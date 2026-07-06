@@ -52,10 +52,15 @@ int main(int argc, char *argv[])
 
   printf("TLS channel established\n");
 
-  if (Login7(ssl, s, user, pass, db) != 0)
+  /* Empty username (or "-") selects integrated Windows authentication (SSPI);
+   * otherwise a normal SQL login with the supplied credentials. */
+  int integrated = (user[0] == '\0' || strcmp(user, "-") == 0);
+  int auth_rc = integrated ? Login7_integrated(ssl, s, host, port, db)
+                           : Login7(ssl, s, user, pass, db);
+  if (auth_rc != 0)
       goto cleanup;
 
-  printf("Login Success\n");
+  printf("Login Success%s\n", integrated ? " (integrated)" : "");
 
   run_repl(ssl, s);   /* interactive T-SQL loop (TLS or plaintext per g_encrypt) */
   rc = 0;

@@ -54,7 +54,7 @@ UCRT64** on Windows 11.
 
 ```sh
 # Windows (MSYS2 UCRT64)
-gcc -Wall *.c -o tdsh.exe -lws2_32 -lssl -lcrypto
+gcc -Wall *.c -o tdsh.exe -lws2_32 -lsecur32 -lssl -lcrypto
 
 # Linux / Unix
 gcc -Wall *.c -o tdsh -lssl -lcrypto        # add -lrt on very old glibc
@@ -87,6 +87,12 @@ Two ways to connect:
 
 The interactive form offers sensible defaults (`localhost`, `1433`, `sa`,
 `master`) and masks the password as you type.
+
+**Integrated Windows auth (experimental, Windows only):** enter `-` as the
+username (or pass an empty username on the command line) to authenticate with
+your current Windows identity via SSPI/Negotiate instead of a SQL login — no
+password needed. The SSPI token exchange is implemented to spec but has not yet
+been validated against a domain-joined server.
 
 After `Login Success` you land in the prompt. Type T-SQL across as many lines as
 you like and enter **`GO`** on its own line to run the batch. Everything `tdsh`
@@ -191,6 +197,7 @@ cross-module prototypes):
 | `render.c` | display-width math, coloured box tables, expanded layout, pager, CSV/TSV export, and the result token-stream walk |
 | `repl.c` | batch execution, `GO` buffering, meta-commands, the line editor + history, and the connection form |
 | `platform.c` | OS abstraction: sockets init, console/terminal size, raw keystrokes, monotonic clock, and text conversions (Windows + POSIX) |
+| `sspi.c` | SSPI/Negotiate wrapper for integrated Windows authentication (Windows; POSIX stub) |
 | `main.c` | orchestration (connect → pre-login → TLS → login → REPL) and the global definitions |
 
 ### Result-set support
@@ -258,7 +265,9 @@ Still ahead:
 
 - **POSIX/Linux port** — the `platform.c` abstraction is in place and the POSIX
   branch is written; it still needs to be compiled and exercised on Linux.
-- **Integrated Windows auth** (SSPI/NTLM) alongside SQL login.
+- **Integrated Windows auth** — implemented via SSPI/Negotiate (the `sspi.c`
+  wrapper + a LOGIN7 `fIntSecurity` path); the SSPI token generation is verified
+  locally, but the end-to-end exchange still needs a Windows-auth server.
 - **Connection resilience** (keep-alive, timeouts, reconnect on a dropped link).
 
 ---

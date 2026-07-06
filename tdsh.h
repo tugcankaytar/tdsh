@@ -26,12 +26,13 @@
 /* ---- Constants ---- */
 #define RECV_BUFLEN      16384
 #define TLS_BUFLEN       4096
-#define LOGIN7_BUFLEN    512    /* max size of a LOGIN7 packet body we build */
+#define LOGIN7_BUFLEN    2048   /* max size of a LOGIN7 packet body we build (room for an SSPI token) */
 #define U16_FIELD_MAX    1024   /* max chars (incl. null) per UTF-16LE field buffer */
 
 #define TDS_PKT_PRELOGIN 0x12   /* pre-login and TLS-handshake packets are wrapped with this type */
 #define TDS_PKT_LOGIN7   0x10   /* Login7 packet type */
 #define TDS_PKT_SQLBATCH 0x01   /* SQL batch (query) packet type */
+#define TDS_PKT_SSPI     0x11   /* SSPI message (integrated-auth token exchange) */
 #define TDS_STATUS_EOM   0x01   /* End Of Message (status byte bit 0) */
 #define TDS_HEADER_LEN   8      /* every TDS packet starts with an 8-byte header */
 #define TDS_PKT_SIZE     4096   /* negotiated packet size (matches LOGIN7 PacketSize) */
@@ -119,6 +120,7 @@ int    tds_send_prelogin(SOCKET s, unsigned char *recvbuf, int recvbuflen);
 SSL   *ssl_setup(SSL_CTX **out_ctx);
 int    tds_tls_handshake(SSL *ssl, SOCKET s, unsigned char *recvbuf, int recvbuflen);
 int    Login7(SSL *ssl, SOCKET s, const char *username, const char *password, const char *database);
+int    Login7_integrated(SSL *ssl, SOCKET s, const char *host, const char *port, const char *database);
 int    tds_send_message(SSL *ssl, SOCKET s, int enc, unsigned char type,
                         const unsigned char *data, int datalen);
 unsigned char *tds_read_message(SSL *ssl, SOCKET s, int enc, int *outlen);

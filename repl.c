@@ -455,8 +455,9 @@ void prompt_connection(char *host, char *port, char *user,
 
     read_field   ("Host",     "localhost", host, 256);
     read_field   ("Port",     "1433",      port, 256);
-    read_field   ("Username", "sa",        user, 256);
-    read_password("Password",              pass, 256);
+    read_field   ("Username", "sa",        user, 256);   /* "-" = integrated Windows auth */
+    if (strcmp(user, "-") == 0) pass[0] = '\0';           /* no password for integrated auth */
+    else read_password("Password",         pass, 256);
     read_field   ("Database", "master",    db,   256);
 
     printf("\n  %s→%s connecting to %s%s@%s:%s/%s%s ...\n\n",

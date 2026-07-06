@@ -1,4 +1,5 @@
 #include "tdsh.h"
+#include "sspi.h"
 
 /* Pre-login body: example packet from MS-TDS spec 4.1 (47 bytes including header).
  *
@@ -522,6 +523,167 @@ int Login7(SSL *ssl, SOCKET s,
   int lrc = parse_login_response(tok, tok_len);
   free(tok);
   return lrc;
+}
+
+/* ============================================================
+ *  Integrated (Windows) authentication — LOGIN7 with fIntSecurity + SSPI
+ *
+ *  EXPERIMENTAL / Windows-only. Requires a SQL Server that accepts Windows auth;
+ *  it has not been validated against a domain-joined server. The flow: send a
+ *  LOGIN7 whose SSPI field carries the first SSPI (Negotiate) token, then loop —
+ *  each server SSPI token (0xED) is fed back into SSPI, and the reply is sent as
+ *  a 0x11 SSPI packet — until a LOGINACK arrives.
+ * ============================================================ */
+
+#ifdef _WIN32
+
+/* Writes a raw-byte LOGIN7 field (offset + byte length), like write_field but
+ * without the UTF-16 char-count doubling — used for the binary SSPI blob. */
+static void write_field_bytes(unsigned char *login7, int *table_pos, int *data_pos,
+                              const unsigned char *data, int nbytes)
+{
+    login7[*table_pos + 0] = (*data_pos) & 0xFF;
+    login7[*table_pos + 1] = (*data_pos >> 8) & 0xFF;
+    login7[*table_pos + 2] = nbytes & 0xFF;
+    login7[*table_pos + 3] = (nbytes >> 8) & 0xFF;
+    if (nbytes > 0) memcpy(login7 + *data_pos, data, nbytes);
+    *table_pos += 4;
+    *data_pos  += nbytes;
+}
+
+/* Walks a login-response token stream: sets *login_ok on LOGINACK, prints ERROR
+ * tokens, and captures the latest SSPI (0xED) challenge into *sspi (malloc'd). */
+static void scan_auth_response(const unsigned char *tok, int tok_len,
+                               int *login_ok, unsigned char **sspi, int *sspi_len)
+{
+    *login_ok = 0; *sspi = NULL; *sspi_len = 0;
+    int i = 0;
+    while (i < tok_len) {
+        unsigned char type = tok[i++];
+        if ((type & 0x30) == 0x20) {                 /* variable-length token */
+            if (i + 2 > tok_len) break;
+            int len = tok[i] | (tok[i + 1] << 8); i += 2;
+            if (len > tok_len - i) len = tok_len - i;
+            if (type == 0xAD)      *login_ok = 1;                    /* LOGINACK */
+            else if (type == 0xAA) print_error_token(tok + i, len); /* ERROR */
+            else if (type == 0xED) {                                /* SSPI challenge */
+                free(*sspi);
+                *sspi = malloc(len ? len : 1);
+                if (*sspi) { memcpy(*sspi, tok + i, len); *sspi_len = len; }
+            }
+            i += len;
+        } else if (type == 0xFD || type == 0xFE || type == 0xFF) {
+            i += 12;
+        } else {
+            break;
+        }
+    }
+}
+
+/* Sends one SSPI (0x11) packet carrying an outbound SSPI token. */
+static int send_sspi_packet(SSL *ssl, SOCKET s, const unsigned char *tok, int toklen)
+{
+    unsigned char *pkt = malloc(TDS_HEADER_LEN + toklen);
+    if (!pkt) return -1;
+    tds_build_header(pkt, TDS_PKT_SSPI, toklen);
+    memcpy(pkt + TDS_HEADER_LEN, tok, toklen);
+    int rc = tds_send_app_data(ssl, s, pkt, TDS_HEADER_LEN + toklen);
+    free(pkt);
+    return rc;
+}
+
+#endif /* _WIN32 */
+
+int Login7_integrated(SSL *ssl, SOCKET s, const char *host, const char *port,
+                      const char *database)
+{
+#ifndef _WIN32
+    (void)ssl; (void)s; (void)host; (void)port; (void)database;
+    printf("integrated (Windows) authentication is only available on Windows\n");
+    return -1;
+#else
+    if (!sspi_supported()) { printf("SSPI is not available\n"); return -1; }
+
+    char spn[600];
+    snprintf(spn, sizeof spn, "MSSQLSvc/%s:%s", host, port);   /* SQL Server SPN */
+
+    SspiState *st = sspi_new();
+    if (!st) { printf("sspi_new failed\n"); return -1; }
+
+    unsigned char *tok = NULL; int toklen = 0;
+    if (sspi_first(st, spn, &tok, &toklen) != 0) { sspi_free(st); return -1; }
+
+    /* Build LOGIN7: fIntSecurity set, empty UserName/Password, SSPI = first token. */
+    size_t dlen = strlen(database);
+    if (dlen >= U16_FIELD_MAX || 94 + dlen * 2 + (size_t)toklen + 32 > LOGIN7_BUFLEN) {
+        printf("integrated LOGIN7 too large\n"); free(tok); sspi_free(st); return -1;
+    }
+    uint16_t u16_database[U16_FIELD_MAX];
+    ascii_to_utf16le(database, u16_database, U16_FIELD_MAX);
+
+    unsigned char login7[LOGIN7_BUFLEN];
+    memset(login7, 0, sizeof login7);
+    memcpy(login7, LOGIN7_HEADER, sizeof LOGIN7_HEADER);
+    login7[25] |= 0x80;                             /* OptionFlags2: fIntSecurity */
+
+    int data_pos = 94, table_pos = 36;
+    write_field(login7, &table_pos, &data_pos, NULL, 0);                    /* HostName */
+    write_field(login7, &table_pos, &data_pos, NULL, 0);                    /* UserName (empty) */
+    write_field(login7, &table_pos, &data_pos, NULL, 0);                    /* Password (empty) */
+    write_field(login7, &table_pos, &data_pos, NULL, 0);                    /* AppName */
+    write_field(login7, &table_pos, &data_pos, NULL, 0);                    /* ServerName */
+    write_field(login7, &table_pos, &data_pos, NULL, 0);                    /* Unused */
+    write_field(login7, &table_pos, &data_pos, NULL, 0);                    /* CltIntName */
+    write_field(login7, &table_pos, &data_pos, NULL, 0);                    /* Language */
+    write_field(login7, &table_pos, &data_pos, u16_database, (int)dlen);    /* Database */
+    memset(login7 + table_pos, 0, 6); table_pos += 6;                      /* ClientID */
+    write_field_bytes(login7, &table_pos, &data_pos, tok, toklen);          /* SSPI */
+    write_field(login7, &table_pos, &data_pos, NULL, 0);                    /* AtchDBFile */
+    write_field(login7, &table_pos, &data_pos, NULL, 0);                    /* ChangePassword */
+    memset(login7 + table_pos, 0, 4); table_pos += 4;                      /* SSPILong */
+    free(tok); tok = NULL;
+
+    login7[0] = data_pos & 0xFF;         login7[1] = (data_pos >> 8) & 0xFF;
+    login7[2] = (data_pos >> 16) & 0xFF; login7[3] = (data_pos >> 24) & 0xFF;
+
+    unsigned char *pkt = malloc(TDS_HEADER_LEN + data_pos);
+    if (!pkt) { sspi_free(st); return -1; }
+    tds_build_header(pkt, TDS_PKT_LOGIN7, data_pos);
+    memcpy(pkt + TDS_HEADER_LEN, login7, data_pos);
+    int sent = tds_send_app_data(ssl, s, pkt, TDS_HEADER_LEN + data_pos);
+    free(pkt);
+    if (sent <= 0) { printf("integrated LOGIN7 send failed\n"); sspi_free(st); return -1; }
+
+    plat_set_recv_timeout(s, 15000);
+
+    for (int round = 0; round < 10; round++) {
+        int rlen = 0;
+        unsigned char *resp = tds_read_message(ssl, s, g_encrypt, &rlen);
+        if (!resp) { printf("no login response\n"); sspi_free(st); return -1; }
+
+        int login_ok = 0; unsigned char *chal = NULL; int chal_len = 0;
+        scan_auth_response(resp, rlen, &login_ok, &chal, &chal_len);
+        free(resp);
+
+        if (login_ok) { free(chal); sspi_free(st); return 0; }       /* success */
+        if (!chal) { printf("integrated login failed (no LOGINACK)\n"); sspi_free(st); return -1; }
+
+        unsigned char *out = NULL; int outlen = 0, done = 0;
+        int rc = sspi_next(st, spn, chal, chal_len, &out, &outlen, &done);
+        free(chal);
+        if (rc != 0) { free(out); sspi_free(st); return -1; }
+
+        if (outlen > 0 && send_sspi_packet(ssl, s, out, outlen) <= 0) {
+            printf("SSPI packet send failed\n"); free(out); sspi_free(st); return -1;
+        }
+        free(out);
+        /* loop to read the next challenge or the LOGINACK */
+    }
+
+    printf("integrated login did not complete\n");
+    sspi_free(st);
+    return -1;
+#endif
 }
 
 /* ============================================================
