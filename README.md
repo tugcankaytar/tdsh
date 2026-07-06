@@ -53,23 +53,27 @@ Example:
 ```
 
 After `Login Success` you land in the interactive prompt. Type a T-SQL statement,
-press Enter, and the result comes back as a table. `exit`, `quit`, or EOF
-(`Ctrl+Z` then Enter on Windows) leaves the loop.
+press Enter, and the result comes back as a coloured box table. `\exit` (or `\q`,
+or EOF — `Ctrl+Z` then Enter on Windows) leaves the loop. Every command tdsh
+handles itself starts with a backslash; `\help` lists them.
 
 ```
 Login Success
 
-tdsh interactive — enter T-SQL and press Enter. Type 'exit' or 'quit' to leave.
+  tdsh interactive — type T-SQL and press Enter, \help for commands.
+
 tdsh> SELECT name, database_id FROM sys.databases
- name   | database_id
---------+-------------
- master |           1
- tempdb |           2
- model  |           3
- msdb   |           4
+┌────────┬─────────────┐
+│ name   │ database_id │
+├────────┼─────────────┤
+│ master │           1 │
+│ tempdb │           2 │
+│ model  │           3 │
+│ msdb   │           4 │
+└────────┴─────────────┘
 (4 rows)
 
-tdsh> exit
+tdsh> \exit
 ```
 
 Each line is sent as its own batch, so `GO`-style multi-statement buffering is not
@@ -81,15 +85,19 @@ like psql's `\x`:
 
 ```
 tdsh> SELECT * FROM ETKINLIK
--[ RECORD 1 ]-+------------------------
-id            | 1
-ad            | Bahar Konseri
-tarih         | 2024-04-20
+[ RECORD 1 ]──┼────────────────────────
+id            │ 1
+ad            │ Bahar Konseri
+tarih         │ 2024-04-20
 ...
 ```
 
-Meta-commands: `\x` toggles expanded display on/off (off = auto), `\clear` (or
-`\cls`) clears the screen.
+Long result sets are **paged** a screenful at a time (Enter/Space for the next
+page, `q` to stop) so nothing scrolls off unseen.
+
+Meta-commands (all start with `\`): `\help`/`\?` show the command list, `\x`
+toggles expanded display on/off (off = auto), `\pager` toggles paging, `\clear`
+(or `\cls`) clears the screen, `\exit`/`\q` leaves.
 
 ## How it is structured
 

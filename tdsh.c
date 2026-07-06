@@ -56,13 +56,45 @@ static int g_expanded = 0;
  * \clear can wipe the scrollback with ESC[3J instead of just the visible area. */
 static int g_vt = 0;
 
-/* ANSI SGR codes for the connection form. They expand to "" when VT processing
- * is off (older console), so the form still reads cleanly without colours. */
-#define CLR_RESET (g_vt ? "\x1b[0m"  : "")
-#define CLR_BOLD  (g_vt ? "\x1b[1m"  : "")
-#define CLR_DIM   (g_vt ? "\x1b[2m"  : "")
-#define CLR_CYAN  (g_vt ? "\x1b[36m" : "")
-#define CLR_GREEN (g_vt ? "\x1b[32m" : "")
+/* 1 => page long result sets one screen at a time (like `less`/psql's pager);
+ * 0 => dump everything at once. Toggled with \pager in the REPL. */
+static int g_pager = 1;
+
+/* ANSI SGR codes for the connection form and result tables. They expand to ""
+ * when VT processing is off (older console), so everything still reads cleanly
+ * without colours. */
+#define CLR_RESET  (g_vt ? "\x1b[0m"  : "")
+#define CLR_BOLD   (g_vt ? "\x1b[1m"  : "")
+#define CLR_DIM    (g_vt ? "\x1b[2m"  : "")
+#define CLR_CYAN   (g_vt ? "\x1b[36m" : "")
+#define CLR_GREEN  (g_vt ? "\x1b[32m" : "")
+#define CLR_RED    (g_vt ? "\x1b[31m" : "")
+#define CLR_YELLOW (g_vt ? "\x1b[33m" : "")
+#define CLR_BLUE   (g_vt ? "\x1b[34m" : "")
+
+/* Box-drawing glyphs for result tables. Unicode line-drawing on a modern
+ * console (the output CP is UTF-8), ASCII fallback when VT is unavailable so
+ * the grid still reads on legacy consoles. Indices: horizontal, vertical, then
+ * the corners/junctions top-left..bottom-right. */
+typedef struct {
+    const char *h, *v;
+    const char *tl, *tm, *tr;   /* top    row: ┌ ┬ ┐ */
+    const char *ml, *mm, *mr;   /* middle sep: ├ ┼ ┤ */
+    const char *bl, *bm, *br;   /* bottom row: └ ┴ ┘ */
+} BoxChars;
+
+static BoxChars box_chars(void)
+{
+    if (g_vt) {
+        BoxChars b = { "\xe2\x94\x80", "\xe2\x94\x82",
+                       "\xe2\x94\x8c", "\xe2\x94\xac", "\xe2\x94\x90",
+                       "\xe2\x94\x9c", "\xe2\x94\xbc", "\xe2\x94\xa4",
+                       "\xe2\x94\x94", "\xe2\x94\xb4", "\xe2\x94\x98" };
+        return b;
+    }
+    BoxChars b = { "-", "|", "+", "+", "+", "+", "+", "+", "+", "+", "+" };
+    return b;
+}
 
 #ifndef ENABLE_VIRTUAL_TERMINAL_PROCESSING
 #define ENABLE_VIRTUAL_TERMINAL_PROCESSING 0x0004
@@ -426,7 +458,8 @@ static void print_error_token(const unsigned char *p, int len)
 
     char msg[2048];
     utf8_from_utf16le(p + off, msg_chars * 2, msg, sizeof msg);
-    printf("server error: %s\n", msg);
+    printf("%s%serror:%s %s%s%s\n",
+           CLR_BOLD, CLR_RED, CLR_RESET, CLR_RED, msg, CLR_RESET);
 }
 
 /* Walks the TDS token stream of a login response and reports success/failure.
@@ -1234,6 +1267,9 @@ static char **table_new_row(Table *t)
 
 static void print_repeat(char ch, int n) { for (int i = 0; i < n; i++) putchar(ch); }
 
+/* Repeat a (possibly multi-byte) glyph string n times — used for box borders. */
+static void print_repeat_s(const char *s, int n) { for (int i = 0; i < n; i++) fputs(s, stdout); }
+
 /* Display width of a UTF-8 string = number of code points (good enough for
  * Latin/Turkish text; wide CJK glyphs are undercounted). */
 static int utf8_ncols(const char *s)
@@ -1285,6 +1321,61 @@ static int term_width(void)
     return 80;
 }
 
+/* Visible terminal height in rows (falls back to 24 when not a console). */
+static int term_height(void)
+{
+    CONSOLE_SCREEN_BUFFER_INFO csbi;
+    if (GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), &csbi)) {
+        int h = csbi.srWindow.Bottom - csbi.srWindow.Top + 1;
+        if (h > 0) return h;
+    }
+    return 24;
+}
+
+/* True when stdout is a real console (not redirected to a file/pipe). Paging is
+ * only meaningful — and only able to read a keypress — on an interactive TTY. */
+static int is_console(void)
+{
+    CONSOLE_SCREEN_BUFFER_INFO csbi;
+    return GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), &csbi) != 0;
+}
+
+/* ---- screenful pager ------------------------------------------------------
+ * Renderers emit content lines and call pager_step() after each one. When a
+ * screenful has scrolled by, we pause with a "-- more --" prompt and wait for a
+ * keypress: Enter/Space shows the next page, q quits early. The pager is inert
+ * (every step returns 1) when disabled, when the whole result already fits, or
+ * when output is not a console. */
+typedef struct { int enabled, budget, page, quit; } Pager;
+
+static void pager_init(Pager *p, int total_lines)
+{
+    p->quit = 0;
+    p->page = term_height() - 4;                 /* leave room for prompt + borders */
+    if (p->page < 4) p->page = 4;
+    p->budget  = p->page;
+    p->enabled = g_pager && is_console() && total_lines > p->page;
+}
+
+/* Call after printing one content line. Returns 0 if the user asked to stop. */
+static int pager_step(Pager *p)
+{
+    if (!p->enabled) return 1;
+    if (--p->budget > 0) return 1;
+
+    printf("%s  -- more --  (Enter/Space: next page   q: quit)%s", CLR_DIM, CLR_RESET);
+    fflush(stdout);
+    int ch = _getch();
+    fputs("\r", stdout);                          /* wipe the prompt line, stay put */
+    print_repeat(' ', 52);
+    fputs("\r", stdout);
+    fflush(stdout);
+
+    if (ch == 'q' || ch == 'Q' || ch == 3) { p->quit = 1; return 0; }
+    p->budget = p->page;
+    return 1;
+}
+
 /* Numeric columns are right-justified (looks cleaner, like psql). */
 static int col_is_numeric(uint8_t t)
 {
@@ -1301,45 +1392,94 @@ static int col_is_numeric(uint8_t t)
 }
 
 #define NORMAL_CAP 60   /* max natural column width in the normal (grid) layout */
+#define MIN_COL     4   /* floor a column may be shrunk to so the grid still fits */
 
-static void print_rowcount(const Table *t)
+/* Is this cell a SQL NULL? (rendered dimmed and centred-neutral.) */
+static int cell_is_null(const char *s) { return s && strcmp(s, "NULL") == 0; }
+
+/* Footer summarising a result set. When the pager stopped early, say how much of
+ * the set was actually shown so a truncated view is never mistaken for the whole. */
+static void print_rowcount(const Table *t, int shown, int stopped)
 {
-    printf("(%d row%s)%s\n\n", t->nrows, t->nrows == 1 ? "" : "s",
-           t->truncated ? " [truncated]" : "");
+    if (stopped && shown < t->nrows)
+        printf("%s(showing %d of %d rows)%s\n\n",
+               CLR_DIM, shown, t->nrows, CLR_RESET);
+    else
+        printf("%s(%d row%s)%s%s\n\n",
+               CLR_DIM, t->nrows, t->nrows == 1 ? "" : "s", CLR_RESET,
+               t->truncated ? "  [truncated]" : "");
 }
 
-/* Classic grid layout: header, separator, rows. w[] holds each column width. */
+/* One horizontal box rule spanning every column; `l`,`mid`,`r` pick the junction
+ * glyphs (top / middle / bottom flavours of the corners). */
+static void render_rule(const Table *t, const int *w, const BoxChars *b,
+                        const char *l, const char *mid, const char *r)
+{
+    fputs(CLR_DIM, stdout);
+    fputs(l, stdout);
+    for (int c = 0; c < t->ncols; c++) {
+        print_repeat_s(b->h, w[c] + 2);
+        fputs(c < t->ncols - 1 ? mid : r, stdout);
+    }
+    fputs(CLR_RESET, stdout);
+    putchar('\n');
+}
+
+/* Prints a single vertical border glyph, dimmed. */
+static void render_bar(const BoxChars *b)
+{
+    fputs(CLR_DIM, stdout); fputs(b->v, stdout); fputs(CLR_RESET, stdout);
+}
+
+/* Classic grid layout in a coloured box: header, separator, rows, footer.
+ * w[] holds each column's display width; rows are paged a screenful at a time. */
 static void render_normal(Table *t, const int *w)
 {
-    for (int c = 0; c < t->ncols; c++) {             /* header */
+    BoxChars b = box_chars();
+
+    render_rule(t, w, &b, b.tl, b.tm, b.tr);         /* ┌─┬─┐ */
+
+    render_bar(&b);                                  /* header row */
+    for (int c = 0; c < t->ncols; c++) {
         putchar(' ');
+        printf("%s%s", CLR_BOLD, CLR_CYAN);
         print_padded(t->cols[c].name, w[c], col_is_numeric(t->cols[c].type));
+        fputs(CLR_RESET, stdout);
         putchar(' ');
-        if (c < t->ncols - 1) putchar('|');
+        render_bar(&b);
     }
     putchar('\n');
-    for (int c = 0; c < t->ncols; c++) {             /* separator */
-        print_repeat('-', w[c] + 2);
-        if (c < t->ncols - 1) putchar('+');
-    }
-    putchar('\n');
-    for (int r = 0; r < t->nrows; r++) {             /* rows */
+
+    render_rule(t, w, &b, b.ml, b.mm, b.mr);         /* ├─┼─┤ */
+
+    Pager pg; pager_init(&pg, t->nrows);
+    int r = 0;
+    for (; r < t->nrows; r++) {                       /* data rows */
+        render_bar(&b);
         for (int c = 0; c < t->ncols; c++) {
             const char *cell = t->rows[r][c] ? t->rows[r][c] : "";
+            int nul = cell_is_null(cell);
             putchar(' ');
+            if (nul) fputs(CLR_DIM, stdout);
             print_padded(cell, w[c], col_is_numeric(t->cols[c].type));
+            if (nul) fputs(CLR_RESET, stdout);
             putchar(' ');
-            if (c < t->ncols - 1) putchar('|');
+            render_bar(&b);
         }
         putchar('\n');
+        if (!pager_step(&pg)) { r++; break; }        /* user quit the pager */
     }
-    print_rowcount(t);
+
+    render_rule(t, w, &b, b.bl, b.bm, b.br);         /* └─┴─┘ */
+    print_rowcount(t, r, pg.quit);
 }
 
 /* Expanded layout (psql's \x): one "column | value" line per field, grouped
- * per record. Used for tables too wide to fit the terminal as a grid. */
+ * per record. Used for tables too wide to fit the terminal as a grid. Paged by
+ * output line so very tall records don't scroll off unseen. */
 static void render_expanded(Table *t)
 {
+    BoxChars b = box_chars();
     int namew = 0;
     for (int c = 0; c < t->ncols; c++) {
         int l = utf8_ncols(t->cols[c].name);
@@ -1351,23 +1491,35 @@ static void render_expanded(Table *t)
     int valw = term_width() - namew - 3;             /* "name | value" */
     if (valw < 8) valw = 8;
 
-    for (int r = 0; r < t->nrows; r++) {
+    Pager pg; pager_init(&pg, t->nrows * (t->ncols + 1));
+    int shown = 0;
+    for (int r = 0; r < t->nrows && !pg.quit; r++) {
         char label[48];
-        snprintf(label, sizeof label, "-[ RECORD %d ]", r + 1);
-        fputs(label, stdout);
-        for (int i = (int)strlen(label); i < namew + 1; i++) putchar('-');
-        putchar('+');
-        print_repeat('-', valw + 1);
+        int n = snprintf(label, sizeof label, "[ RECORD %d ]", r + 1);
+        printf("%s%s%s%s", CLR_DIM, CLR_CYAN, label, CLR_RESET);
+        fputs(CLR_DIM, stdout);
+        for (int i = n; i < namew + 1; i++) fputs("\xe2\x94\x80", stdout);   /* ─ */
+        fputs("\xe2\x94\xbc", stdout);                                       /* ┼ */
+        for (int i = 0; i < valw + 1; i++) fputs("\xe2\x94\x80", stdout);
+        fputs(CLR_RESET, stdout);
         putchar('\n');
+        if (!pager_step(&pg)) break;
 
         for (int c = 0; c < t->ncols; c++) {
+            printf("%s%s", CLR_BOLD, CLR_CYAN);
             print_padded(t->cols[c].name, namew, 0);
-            fputs(" | ", stdout);
-            print_clip(t->rows[r][c] ? t->rows[r][c] : "", valw);   /* no trailing pad */
+            fputs(CLR_RESET, stdout);
+            fputs(" ", stdout); render_bar(&b); fputs(" ", stdout);
+            const char *v = t->rows[r][c] ? t->rows[r][c] : "";
+            if (cell_is_null(v)) fputs(CLR_DIM, stdout);
+            print_clip(v, valw);                     /* no trailing pad */
+            if (cell_is_null(v)) fputs(CLR_RESET, stdout);
             putchar('\n');
+            if (!pager_step(&pg)) break;
         }
+        shown = r + 1;
     }
-    print_rowcount(t);
+    print_rowcount(t, shown, pg.quit);
 }
 
 static void table_render(Table *t)
@@ -1377,7 +1529,7 @@ static void table_render(Table *t)
     /* natural width of each column = widest of its header and cells (display
      * cols), capped so one long text column doesn't blow up the grid. */
     int w[MAX_COLS];
-    long total = 2 * t->ncols + (t->ncols - 1);      /* borders/separators */
+    long total = 3 * t->ncols + 1;                   /* box borders + separators */
     for (int c = 0; c < t->ncols; c++) {
         int mx = utf8_ncols(t->cols[c].name);
         for (int r = 0; r < t->nrows; r++) {
@@ -1390,8 +1542,20 @@ static void table_render(Table *t)
         total += mx;
     }
 
+    /* If the grid is a touch too wide, steal columns from the widest fields
+     * (clipping their cells with an ellipsis) so the data still fits the screen
+     * as a readable grid instead of dropping straight to the expanded layout. */
+    int avail = term_width();
+    while (total > avail) {
+        int wc = -1, wmax = MIN_COL;
+        for (int c = 0; c < t->ncols; c++)
+            if (w[c] > wmax) { wmax = w[c]; wc = c; }
+        if (wc < 0) break;                           /* nothing left to shrink */
+        w[wc]--; total--;
+    }
+
     /* Grid when it fits; otherwise fall back to the readable expanded layout. */
-    if (g_expanded || total > term_width())
+    if (g_expanded || total > avail)
         render_expanded(t);
     else
         render_normal(t, w);
@@ -1481,7 +1645,7 @@ static void parse_result_stream(const unsigned char *tok, int len)
     }
 
     if (t.ncols > 0 || t.nrows > 0) table_render(&t);
-    else if (!any_output) printf("(command completed, no result set)\n");
+    else if (!any_output) printf("%s(command completed, no result set)%s\n\n", CLR_DIM, CLR_RESET);
     table_reset(&t);
 }
 
@@ -1548,7 +1712,26 @@ static void clear_screen(void)
     SetConsoleCursorPosition(h, home);
 }
 
-/* Interactive read-eval-print loop: each entered line is sent as one batch. */
+/* Lists the backslash meta-commands. All of tdsh's own commands start with '\';
+ * anything else is sent to the server verbatim as a T-SQL batch. */
+static void print_repl_help(void)
+{
+    printf("\n  %smeta-commands%s %s(everything else is run as T-SQL)%s\n",
+           CLR_BOLD, CLR_RESET, CLR_DIM, CLR_RESET);
+    printf("    %s\\help%s, %s\\?%s      show this help\n",
+           CLR_CYAN, CLR_RESET, CLR_CYAN, CLR_RESET);
+    printf("    %s\\x%s            toggle expanded (one-field-per-line) display\n",
+           CLR_CYAN, CLR_RESET);
+    printf("    %s\\pager%s        toggle screen-at-a-time paging of long results\n",
+           CLR_CYAN, CLR_RESET);
+    printf("    %s\\clear%s, %s\\cls%s  clear the screen\n",
+           CLR_CYAN, CLR_RESET, CLR_CYAN, CLR_RESET);
+    printf("    %s\\exit%s, %s\\q%s     leave tdsh  (or Ctrl+Z then Enter)\n\n",
+           CLR_CYAN, CLR_RESET, CLR_CYAN, CLR_RESET);
+}
+
+/* Interactive read-eval-print loop: each entered line is sent as one batch,
+ * unless it is a '\'-prefixed meta-command handled locally. */
 static void run_repl(SSL *ssl, SOCKET s)
 {
     char line[8192];
@@ -1557,25 +1740,38 @@ static void run_repl(SSL *ssl, SOCKET s)
     DWORD timeout = 60000;
     setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&timeout, sizeof(timeout));
 
-    printf("\ntdsh interactive — enter T-SQL and press Enter.\n"
-           "  \\x   toggle expanded display    \\clear   clear screen    "
-           "exit / quit   leave\n");
+    printf("\n  %s%stdsh%s %sinteractive%s — type T-SQL and press Enter, "
+           "%s\\help%s for commands.\n\n",
+           CLR_BOLD, CLR_CYAN, CLR_RESET, CLR_DIM, CLR_RESET,
+           CLR_CYAN, CLR_RESET);
+
     for (;;) {
-        printf("tdsh> ");
+        printf("%s%stdsh>%s ", CLR_BOLD, CLR_GREEN, CLR_RESET);
         fflush(stdout);
         if (!fgets(line, sizeof(line), stdin)) break;   /* EOF (Ctrl+Z / Ctrl+D) */
 
         size_t n = strlen(line);
         while (n && (line[n - 1] == '\n' || line[n - 1] == '\r')) line[--n] = '\0';
         if (n == 0) continue;
-        if (strcmp(line, "exit") == 0 || strcmp(line, "quit") == 0) break;
-        if (strcmp(line, "\\x") == 0) {                 /* toggle expanded display */
-            g_expanded = !g_expanded;
-            printf("Expanded display is %s.\n", g_expanded ? "on" : "off (auto)");
-            continue;
-        }
-        if (strcmp(line, "\\clear") == 0 || strcmp(line, "\\cls") == 0) {
-            clear_screen();                             /* wipe screen, keep only the prompt */
+
+        if (line[0] == '\\') {                          /* meta-command */
+            if (strcmp(line, "\\exit") == 0 || strcmp(line, "\\q") == 0) break;
+            if (strcmp(line, "\\help") == 0 || strcmp(line, "\\?") == 0) {
+                print_repl_help();
+            } else if (strcmp(line, "\\x") == 0) {      /* toggle expanded display */
+                g_expanded = !g_expanded;
+                printf("  %sexpanded display %s%s\n\n", CLR_DIM,
+                       g_expanded ? "on" : "off (auto)", CLR_RESET);
+            } else if (strcmp(line, "\\pager") == 0) {  /* toggle result paging */
+                g_pager = !g_pager;
+                printf("  %spager %s%s\n\n", CLR_DIM,
+                       g_pager ? "on" : "off", CLR_RESET);
+            } else if (strcmp(line, "\\clear") == 0 || strcmp(line, "\\cls") == 0) {
+                clear_screen();                         /* wipe screen, keep only the prompt */
+            } else {
+                printf("  %sunknown command %s%s%s — try %s\\help%s\n\n",
+                       CLR_DIM, CLR_RESET, line, CLR_DIM, CLR_CYAN, CLR_RESET);
+            }
             continue;
         }
 
