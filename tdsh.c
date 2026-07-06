@@ -20,6 +20,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <conio.h>    /* _getch — read password keystrokes without echoing them */
 
 #include <openssl/ssl.h>
 #include <openssl/err.h>
@@ -54,6 +55,14 @@ static int g_expanded = 0;
 /* 1 => ANSI escape (virtual terminal) processing is enabled on the console, so
  * \clear can wipe the scrollback with ESC[3J instead of just the visible area. */
 static int g_vt = 0;
+
+/* ANSI SGR codes for the connection form. They expand to "" when VT processing
+ * is off (older console), so the form still reads cleanly without colours. */
+#define CLR_RESET (g_vt ? "\x1b[0m"  : "")
+#define CLR_BOLD  (g_vt ? "\x1b[1m"  : "")
+#define CLR_DIM   (g_vt ? "\x1b[2m"  : "")
+#define CLR_CYAN  (g_vt ? "\x1b[36m" : "")
+#define CLR_GREEN (g_vt ? "\x1b[32m" : "")
 
 #ifndef ENABLE_VIRTUAL_TERMINAL_PROCESSING
 #define ENABLE_VIRTUAL_TERMINAL_PROCESSING 0x0004
@@ -1575,6 +1584,81 @@ static void run_repl(SSL *ssl, SOCKET s)
 }
 
 /* ============================================================
+ *  Interactive connection form
+ * ============================================================ */
+
+/* Reads one text field. Shows the label and, when given, a [default] hint; an
+ * empty Enter keeps the default. fgets gives us native line editing (backspace,
+ * etc.) for free. buf is always null-terminated. */
+static void read_field(const char *label, const char *def, char *buf, int cap)
+{
+    if (def && def[0])
+        printf("  %s%-9s%s %s[%s]%s: ", CLR_BOLD, label, CLR_RESET,
+               CLR_DIM, def, CLR_RESET);
+    else
+        printf("  %s%-9s%s: ", CLR_BOLD, label, CLR_RESET);
+    fflush(stdout);
+
+    if (!fgets(buf, cap, stdin)) { buf[0] = '\0'; }
+    size_t n = strlen(buf);
+    while (n && (buf[n - 1] == '\n' || buf[n - 1] == '\r')) buf[--n] = '\0';
+
+    if (n == 0 && def) {                     /* empty input -> take the default */
+        strncpy(buf, def, cap - 1);
+        buf[cap - 1] = '\0';
+    }
+}
+
+/* Reads the password without echoing it: every keystroke is shown as '*' so the
+ * secret never lands on screen. Handles Backspace, Enter (finish) and Ctrl+C
+ * (abort). Special/arrow keys (_getch prefix 0x00/0xE0) are swallowed. */
+static void read_password(const char *label, char *buf, int cap)
+{
+    printf("  %s%-9s%s: ", CLR_BOLD, label, CLR_RESET);
+    fflush(stdout);
+
+    int len = 0;
+    for (;;) {
+        int ch = _getch();
+        if (ch == '\r' || ch == '\n') break;          /* Enter — done */
+        if (ch == 3) { printf("\n"); exit(1); }       /* Ctrl+C — abort */
+        if (ch == 0 || ch == 0xE0) { _getch(); continue; }  /* eat function/arrow key */
+        if (ch == '\b' || ch == 127) {                /* Backspace — erase one '*' */
+            if (len > 0) { len--; fputs("\b \b", stdout); fflush(stdout); }
+            continue;
+        }
+        if (ch < 32) continue;                         /* ignore other control chars */
+        if (len < cap - 1) {
+            buf[len++] = (char)ch;
+            fputc('*', stdout);
+            fflush(stdout);
+        }
+    }
+    buf[len] = '\0';
+    printf("\n");
+}
+
+/* Asks for the connection details step by step and fills the caller's buffers
+ * (each at least 256 bytes). Sensible defaults are offered for everything but
+ * the password. */
+static void prompt_connection(char *host, char *port, char *user,
+                              char *pass, char *db)
+{
+    printf("\n  %s%stdsh%s %s— connect to SQL Server%s\n",
+           CLR_BOLD, CLR_CYAN, CLR_RESET, CLR_DIM, CLR_RESET);
+    printf("  %s────────────────────────────%s\n\n", CLR_DIM, CLR_RESET);
+
+    read_field   ("Host",     "localhost", host, 256);
+    read_field   ("Port",     "1433",      port, 256);
+    read_field   ("Username", "sa",        user, 256);
+    read_password("Password",              pass, 256);
+    read_field   ("Database", "master",    db,   256);
+
+    printf("\n  %s→%s connecting to %s%s@%s:%s/%s%s ...\n\n",
+           CLR_GREEN, CLR_RESET, CLR_BOLD, user, host, port, db, CLR_RESET);
+}
+
+/* ============================================================
  *  main — orchestrator
  * ============================================================ */
 
@@ -1592,8 +1676,21 @@ int main(int argc, char *argv[])
           g_vt = 1;
   }
 
-  if (argc < 6) {
-      printf("Usage: %s <host> <port> <username> <password> <database>\n", argv[0]);
+  /* Connection details. Filled either from the command line (backward-compatible
+   * scripting mode) or, when no args are given, asked interactively as a form. */
+  char host[256], port[256], user[256], pass[256], db[256];
+
+  if (argc >= 6) {
+      strncpy(host, argv[1], sizeof host - 1); host[sizeof host - 1] = '\0';
+      strncpy(port, argv[2], sizeof port - 1); port[sizeof port - 1] = '\0';
+      strncpy(user, argv[3], sizeof user - 1); user[sizeof user - 1] = '\0';
+      strncpy(pass, argv[4], sizeof pass - 1); pass[sizeof pass - 1] = '\0';
+      strncpy(db,   argv[5], sizeof db   - 1); db[sizeof db     - 1] = '\0';
+  } else if (argc == 1) {
+      prompt_connection(host, port, user, pass, db);
+  } else {
+      printf("Usage: %s [<host> <port> <username> <password> <database>]\n"
+             "  (run with no arguments to fill in the connection form)\n", argv[0]);
       return 1;
   }
 
@@ -1609,7 +1706,7 @@ int main(int argc, char *argv[])
   SSL *ssl     = NULL;
   unsigned char recvbuf[RECV_BUFLEN];
 
-  s = tcp_connect(argv[1], argv[2]);
+  s = tcp_connect(host, port);
   if (s == INVALID_SOCKET)                                  goto cleanup;
 
   if (tds_send_prelogin(s, recvbuf, RECV_BUFLEN) != 0)      goto cleanup;
@@ -1621,7 +1718,7 @@ int main(int argc, char *argv[])
 
   printf("TLS channel established\n");
 
-  if (Login7(ssl, s, argv[3], argv[4], argv[5]) != 0)
+  if (Login7(ssl, s, user, pass, db) != 0)
       goto cleanup;
 
   printf("Login Success\n");
