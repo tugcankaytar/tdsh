@@ -52,12 +52,26 @@
   #define closesocket        close
   #define WSAGetLastError()  (errno)
 
+  #include <fcntl.h>
+  #include <sys/select.h>
+
   typedef uint32_t DWORD;
 
   #define _stricmp  strcasecmp
   #define _strdup   strdup
   #define _getch    plat_getch   /* our termios-based raw reader */
 
+#endif
+
+/* Socket error codes used for resilience checks, normalised across OSes. */
+#ifdef _WIN32
+  #define SOCK_EWOULDBLOCK  WSAEWOULDBLOCK
+  #define SOCK_ETIMEDOUT    WSAETIMEDOUT
+  #define SOCK_EINPROGRESS  WSAEWOULDBLOCK   /* non-blocking connect: WSAEWOULDBLOCK */
+#else
+  #define SOCK_EWOULDBLOCK  EWOULDBLOCK
+  #define SOCK_ETIMEDOUT    ETIMEDOUT
+  #define SOCK_EINPROGRESS  EINPROGRESS
 #endif
 
 /* ---- platform.c ---- */
@@ -68,6 +82,9 @@ void   plat_console_init(void);             /* UTF-8 output + ANSI/VT; sets g_vt
 int    plat_getch(void);                    /* one raw keystroke (Win maps to _getch) */
 double plat_now_ms(void);                   /* monotonic clock, milliseconds (\timing) */
 void   plat_set_recv_timeout(SOCKET s, int ms);
+void   plat_set_keepalive(SOCKET s);        /* enable TCP keep-alive */
+void   plat_set_nonblocking(SOCKET s, int on);
+int    plat_connect_timeout(SOCKET s, const struct sockaddr *addr, int addrlen, int ms);
 
 int    term_width(void);                    /* terminal columns (80 fallback) */
 int    term_height(void);                   /* terminal rows (24 fallback) */

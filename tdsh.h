@@ -70,6 +70,11 @@ extern int g_vt;
 /* 1 => page long result sets one screen at a time; 0 => dump everything. */
 extern int g_pager;
 
+/* Set by tds_read_message when a read fails because the connection was lost
+ * (peer closed / reset), as opposed to a recoverable timeout. The REPL uses it
+ * to leave cleanly instead of erroring on every subsequent query. */
+extern int g_conn_lost;
+
 /* When non-NULL, result sets are written to this file as delimited text
  * (CSV/TSV) instead of the box grid. Set by \o, delimiter picked from the
  * file extension. Defined in repl.c, read by render.c's table_render. */

@@ -145,13 +145,14 @@ SOCKET tcp_connect(const char *host, const char *port)
         return INVALID_SOCKET;
     }
 
-    if (connect(s, result->ai_addr, (int)result->ai_addrlen) == SOCKET_ERROR) {
-        printf("connect() failed: %d\n", WSAGetLastError());
+    if (plat_connect_timeout(s, result->ai_addr, (int)result->ai_addrlen, 10000) != 0) {
+        printf("connect() failed/timed out: %d\n", WSAGetLastError());
         closesocket(s);
         freeaddrinfo(result);
         return INVALID_SOCKET;
     }
 
+    plat_set_keepalive(s);          /* detect a silently dropped peer */
     freeaddrinfo(result);
     return s;
 }
@@ -821,15 +822,27 @@ int tds_send_message(SSL *ssl, SOCKET s, int enc, unsigned char type,
  * transport boundaries) until one arrives with the EOM bit set, concatenating
  * their payloads. Returns a malloc'd token buffer (caller frees) and sets
  * *outlen, or NULL on error. Uses TLS when enc is set. */
+/* Classifies a failed recv: 0 return = orderly close (lost); a timeout/would-block
+ * error is recoverable (just no data in time); anything else = lost. */
+static int conn_lost_from(int r)
+{
+    if (r == 0) return 1;
+    int e = WSAGetLastError();
+    if (e == SOCK_ETIMEDOUT || e == SOCK_EWOULDBLOCK) return 0;
+    return 1;
+}
+
 unsigned char *tds_read_message(SSL *ssl, SOCKET s, int enc, int *outlen)
 {
     int cap = 65536, total = 0;
     unsigned char *buf = malloc(cap);
     unsigned char hdr[TDS_HEADER_LEN];
     if (!buf) return NULL;
+    g_conn_lost = 0;
 
     for (;;) {
-        if (xfer_recv_all(ssl, s, enc, hdr, TDS_HEADER_LEN) <= 0) { free(buf); return NULL; }
+        int r = xfer_recv_all(ssl, s, enc, hdr, TDS_HEADER_LEN);
+        if (r <= 0) { g_conn_lost = conn_lost_from(r); free(buf); return NULL; }
 
         int pkt_len = (hdr[2] << 8) | hdr[3];   /* whole packet, big-endian */
         int payload = pkt_len - TDS_HEADER_LEN;
@@ -842,7 +855,8 @@ unsigned char *tds_read_message(SSL *ssl, SOCKET s, int enc, int *outlen)
             buf = nb;
         }
         if (payload > 0) {
-            if (xfer_recv_all(ssl, s, enc, buf + total, payload) <= 0) { free(buf); return NULL; }
+            int r2 = xfer_recv_all(ssl, s, enc, buf + total, payload);
+            if (r2 <= 0) { g_conn_lost = conn_lost_from(r2); free(buf); return NULL; }
             total += payload;
         }
         if (hdr[1] & TDS_STATUS_EOM) break;   /* last packet of the message */

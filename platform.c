@@ -194,6 +194,56 @@ void plat_set_recv_timeout(SOCKET s, int ms)
 #endif
 }
 
+/* Enable TCP keep-alive so a silently dropped peer is eventually detected. */
+void plat_set_keepalive(SOCKET s)
+{
+    int yes = 1;
+    setsockopt(s, SOL_SOCKET, SO_KEEPALIVE, (const char *)&yes, sizeof yes);
+#if !defined(_WIN32) && defined(TCP_KEEPIDLE)
+    int idle = 30, intvl = 10, cnt = 3;   /* best-effort tuning where supported */
+    setsockopt(s, IPPROTO_TCP, TCP_KEEPIDLE,  &idle,  sizeof idle);
+    setsockopt(s, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof intvl);
+    setsockopt(s, IPPROTO_TCP, TCP_KEEPCNT,   &cnt,   sizeof cnt);
+#endif
+}
+
+void plat_set_nonblocking(SOCKET s, int on)
+{
+#ifdef _WIN32
+    u_long mode = on ? 1 : 0;
+    ioctlsocket(s, FIONBIO, &mode);
+#else
+    int fl = fcntl(s, F_GETFL, 0);
+    if (fl < 0) return;
+    fcntl(s, F_SETFL, on ? (fl | O_NONBLOCK) : (fl & ~O_NONBLOCK));
+#endif
+}
+
+/* connect() with a timeout: connect non-blocking, wait for writability, then
+ * check SO_ERROR. Leaves the socket blocking on return. 0 = ok, -1 = failed. */
+int plat_connect_timeout(SOCKET s, const struct sockaddr *addr, int addrlen, int ms)
+{
+    plat_set_nonblocking(s, 1);
+    int rc = connect(s, addr, addrlen);
+    if (rc == 0) { plat_set_nonblocking(s, 0); return 0; }   /* connected at once */
+
+    if (WSAGetLastError() != SOCK_EINPROGRESS) { plat_set_nonblocking(s, 0); return -1; }
+
+    /* Watch both write and exception sets: a successful connect makes the socket
+     * writable, while a refused/failed connect signals the exception set on
+     * Windows (and sets SO_ERROR everywhere). */
+    fd_set wf, ef; FD_ZERO(&wf); FD_ZERO(&ef); FD_SET(s, &wf); FD_SET(s, &ef);
+    struct timeval tv; tv.tv_sec = ms / 1000; tv.tv_usec = (ms % 1000) * 1000;
+    int sel = select((int)s + 1, NULL, &wf, &ef, &tv);
+    plat_set_nonblocking(s, 0);
+    if (sel <= 0) return -1;                          /* timed out or select error */
+
+    int soerr = 0; socklen_t l = sizeof soerr;
+    if (getsockopt(s, SOL_SOCKET, SO_ERROR, (char *)&soerr, &l) != 0 || soerr != 0)
+        return -1;                                   /* connect refused/failed */
+    return 0;
+}
+
 /* ============================================================
  *  Text conversion
  * ============================================================ */

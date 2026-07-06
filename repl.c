@@ -53,7 +53,12 @@ static int tds_exec(SSL *ssl, SOCKET s, const char *sql)
 
     int rlen = 0;
     unsigned char *resp = tds_read_message(ssl, s, g_encrypt, &rlen);
-    if (!resp) { printf("no response / read error\n"); return -1; }
+    if (!resp) {
+        printf("%s%s%s\n", CLR_RED,
+               g_conn_lost ? "connection to server lost" : "no response / read error",
+               CLR_RESET);
+        return -1;
+    }
 
     parse_result_stream(resp, rlen);
     free(resp);
@@ -365,11 +370,13 @@ void run_repl(SSL *ssl, SOCKET s)
         /* meta-commands only make sense at the start of a fresh batch */
         if (blen == 0 && line[0] == '\\') {
             if (handle_meta(ssl, s, line) == META_QUIT) break;
+            if (g_conn_lost) break;                   /* server gone — leave cleanly */
             continue;
         }
 
         if (is_go_line(line)) {                       /* run the accumulated batch */
             if (blen > 0) { run_batch(ssl, s, batch); blen = 0; batch[0] = '\0'; }
+            if (g_conn_lost) break;                   /* server gone — leave cleanly */
             continue;
         }
 

@@ -238,6 +238,11 @@ Intentionally minimal and lab-oriented:
   doesn't implement (it would accept the login, then drop the first batch).
 - **Query responses are fully reassembled** across TDS packets and `recv`
   boundaries; the pre-login/handshake path still assumes one packet per `recv`.
+- **Connection handling is resilient.** The initial connect has a timeout (so an
+  unreachable host fails fast instead of hanging), TCP keep-alive is enabled, and
+  a dropped link is detected and distinguished from a mere read timeout — the
+  REPL then exits cleanly with "connection to server lost" instead of erroring on
+  every subsequent query.
 - **Output is UTF-8.** The console output code page is switched to UTF-8;
   `n(var)char`/`ntext` decodes from UTF-16LE and legacy `(var)char`/`text` via the
   **code page derived from the column's collation** (the OS locale's ANSI code
@@ -268,7 +273,11 @@ Still ahead:
 - **Integrated Windows auth** — implemented via SSPI/Negotiate (the `sspi.c`
   wrapper + a LOGIN7 `fIntSecurity` path); the SSPI token generation is verified
   locally, but the end-to-end exchange still needs a Windows-auth server.
-- **Connection resilience** (keep-alive, timeouts, reconnect on a dropped link).
+
+That leaves the roadmap essentially complete. A natural next step would be
+**automatic reconnect** (re-running the login on a dropped link) rather than the
+current clean exit, and validating the POSIX and integrated-auth paths on their
+respective targets.
 
 ---
 

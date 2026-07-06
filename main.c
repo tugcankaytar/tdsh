@@ -1,10 +1,11 @@
 #include "tdsh.h"
 
 /* ---- Global session flags (declared extern in tdsh.h) ---- */
-int g_encrypt  = 0;
-int g_expanded = 0;
-int g_vt       = 0;
-int g_pager    = 1;
+int g_encrypt   = 0;
+int g_expanded  = 0;
+int g_vt        = 0;
+int g_pager     = 1;
+int g_conn_lost = 0;
 
 /* ============================================================
  *  main — orchestrator
