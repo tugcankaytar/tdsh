@@ -231,7 +231,10 @@ Intentionally minimal and lab-oriented:
   sending, so non-ASCII literals survive the round trip. Column widths are
   measured in true display columns (a `wcwidth`-style table, so CJK/double-width
   glyphs align).
-- **Rows are buffered before rendering**, capped at 100,000 per result set.
+- **Rows are streamed, not buffered.** Each result set is rendered in two passes
+  over the (already in-memory) response — one to measure column widths, one to
+  print — so memory stays proportional to the column count, not the row count,
+  and there is no fixed row cap.
 
 ---
 
@@ -240,12 +243,11 @@ Intentionally minimal and lab-oriented:
 Shipped recently: modular source layout, multi-line `GO` batching, a history +
 arrow-key line editor, the `\l`/`\dt`/`\d`/`\dn`/`\dv` catalog commands,
 `\timing`, `\o` CSV/TSV export, `wcwidth`-style wide-glyph widths, varchar code
-pages derived from the column collation, and `INFO`/`PRINT` messages plus
-`(N rows affected)`.
+pages derived from the column collation, `INFO`/`PRINT` messages plus
+`(N rows affected)`, and a streaming two-pass renderer (no row cap).
 
 Still ahead:
 
-- **Streaming render** for very large result sets, beyond the 100,000-row buffer.
 - **POSIX/Linux port** (Winsock → BSD sockets, `_getch` → termios).
 - **Integrated Windows auth** (SSPI/NTLM) alongside SQL login.
 - **Connection resilience** (keep-alive, timeouts, reconnect on a dropped link).

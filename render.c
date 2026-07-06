@@ -21,32 +21,7 @@ static BoxChars box_chars(void)
     return b;
 }
 
-/* --- Table buffer management + rendering --- */
-
-static void table_reset(Table *t)
-{
-    for (int r = 0; r < t->nrows; r++) {
-        for (int c = 0; c < t->ncols; c++) free(t->rows[r][c]);
-        free(t->rows[r]);
-    }
-    free(t->rows);
-    t->rows = NULL; t->nrows = 0; t->cap = 0; t->ncols = 0; t->truncated = 0;
-}
-
-static char **table_new_row(Table *t)
-{
-    if (t->nrows >= MAX_ROWS) { t->truncated = 1; return NULL; }
-    if (t->nrows >= t->cap) {
-        int nc = t->cap ? t->cap * 2 : 64;
-        char ***nr = realloc(t->rows, nc * sizeof(char **));
-        if (!nr) return NULL;
-        t->rows = nr; t->cap = nc;
-    }
-    char **row = calloc(t->ncols, sizeof(char *));
-    if (!row) return NULL;
-    t->rows[t->nrows++] = row;
-    return row;
-}
+/* --- rendering helpers --- */
 
 static void print_repeat(char ch, int n) { for (int i = 0; i < n; i++) putchar(ch); }
 
@@ -269,9 +244,63 @@ static void render_bar(const BoxChars *b)
     fputs(CLR_DIM, stdout); fputs(b->v, stdout); fputs(CLR_RESET, stdout);
 }
 
-/* Classic grid layout in a coloured box: header, separator, rows, footer.
- * w[] holds each column's display width; rows are paged a screenful at a time. */
-static void render_normal(Table *t, const int *w)
+/* ---- Row streaming -------------------------------------------------------
+ * Instead of buffering every row's formatted strings, we walk the (already
+ * in-memory) token buffer and format one row at a time into a reused scratch
+ * array. Rendering a result set makes two passes: one to measure column widths,
+ * one to print — so memory stays O(ncols), not O(nrows × ncols), and there is
+ * no fixed row cap. */
+
+/* Formats one ROW/NBCROW body (p is just after the type byte) into cells[], one
+ * buffer of CELL_MAX per column. nbc selects the null-bitmap-compressed layout.
+ * Returns bytes consumed, or -1 on a framing error. */
+static int read_row_body(const Column *cols, int ncols, int nbc,
+                         const unsigned char *p, int avail, char (*cells)[CELL_MAX])
+{
+    int i = 0;
+    const unsigned char *bitmap = NULL;
+    if (nbc) {
+        int nbytes = (ncols + 7) / 8;
+        if (avail < nbytes) return -1;
+        bitmap = p; i = nbytes;
+    }
+    for (int c = 0; c < ncols; c++) {
+        if (nbc && (bitmap[c / 8] & (1 << (c % 8)))) { memcpy(cells[c], "NULL", 5); continue; }
+        int used = 0;
+        if (read_cell(&cols[c], p + i, avail - i, cells[c], CELL_MAX, &used) < 0) return -1;
+        i += used;
+    }
+    return i;
+}
+
+typedef struct {
+    const unsigned char *tok;
+    int pos, len;
+    const Column *cols;
+    int ncols;
+    char (*cells)[CELL_MAX];
+    int error;
+} RowStream;
+
+/* Advances to the next ROW/NBCROW, filling rs->cells. Returns 1 on a row, or 0
+ * at the end of the result set (rs->pos left at the terminating non-row token);
+ * on a framing error returns 0 with rs->error set. */
+static int rowstream_next(RowStream *rs)
+{
+    if (rs->pos >= rs->len) return 0;
+    uint8_t tp = rs->tok[rs->pos];
+    if (tp != 0xD1 && tp != 0xD2) return 0;
+    int used = read_row_body(rs->cols, rs->ncols, tp == 0xD2,
+                             rs->tok + rs->pos + 1, rs->len - rs->pos - 1, rs->cells);
+    if (used < 0) { rs->error = 1; return 0; }
+    rs->pos += 1 + used;
+    return 1;
+}
+
+/* Classic grid layout in a coloured box: header, separator, streamed rows,
+ * footer. w[] holds each column's display width; rows are paged a screenful at
+ * a time and pulled from `rs` one at a time. */
+static void render_normal(Table *t, const int *w, RowStream *rs)
 {
     BoxChars b = box_chars();
 
@@ -292,10 +321,10 @@ static void render_normal(Table *t, const int *w)
 
     Pager pg; pager_init(&pg, t->nrows);
     int r = 0;
-    for (; r < t->nrows; r++) {                       /* data rows */
+    while (rowstream_next(rs)) {                       /* data rows, streamed */
         render_bar(&b);
         for (int c = 0; c < t->ncols; c++) {
-            const char *cell = t->rows[r][c] ? t->rows[r][c] : "";
+            const char *cell = rs->cells[c];
             int nul = cell_is_null(cell);
             putchar(' ');
             if (nul) fputs(CLR_DIM, stdout);
@@ -305,7 +334,8 @@ static void render_normal(Table *t, const int *w)
             render_bar(&b);
         }
         putchar('\n');
-        if (!pager_step(&pg)) { r++; break; }        /* user quit the pager */
+        r++;
+        if (!pager_step(&pg)) break;                  /* user quit the pager */
     }
 
     render_rule(t, w, &b, b.bl, b.bm, b.br);         /* └─┴─┘ */
@@ -315,7 +345,7 @@ static void render_normal(Table *t, const int *w)
 /* Expanded layout (psql's \x): one "column | value" line per field, grouped
  * per record. Used for tables too wide to fit the terminal as a grid. Paged by
  * output line so very tall records don't scroll off unseen. */
-static void render_expanded(Table *t)
+static void render_expanded(Table *t, RowStream *rs)
 {
     BoxChars b = box_chars();
     int namew = 0;
@@ -331,9 +361,9 @@ static void render_expanded(Table *t)
 
     Pager pg; pager_init(&pg, t->nrows * (t->ncols + 1));
     int shown = 0;
-    for (int r = 0; r < t->nrows && !pg.quit; r++) {
+    while (!pg.quit && rowstream_next(rs)) {
         char label[48];
-        int n = snprintf(label, sizeof label, "[ RECORD %d ]", r + 1);
+        int n = snprintf(label, sizeof label, "[ RECORD %d ]", shown + 1);
         printf("%s%s%s%s", CLR_DIM, CLR_CYAN, label, CLR_RESET);
         fputs(CLR_DIM, stdout);
         for (int i = n; i < namew + 1; i++) fputs("\xe2\x94\x80", stdout);   /* ─ */
@@ -348,14 +378,14 @@ static void render_expanded(Table *t)
             print_padded(t->cols[c].name, namew, 0);
             fputs(CLR_RESET, stdout);
             fputs(" ", stdout); render_bar(&b); fputs(" ", stdout);
-            const char *v = t->rows[r][c] ? t->rows[r][c] : "";
+            const char *v = rs->cells[c];
             if (cell_is_null(v)) fputs(CLR_DIM, stdout);
             print_clip(v, valw);                     /* no trailing pad */
             if (cell_is_null(v)) fputs(CLR_RESET, stdout);
             putchar('\n');
             if (!pager_step(&pg)) break;
         }
-        shown = r + 1;
+        shown++;
     }
     print_rowcount(t, shown, pg.quit);
 }
@@ -373,53 +403,72 @@ static void csv_field(FILE *f, const char *s, char delim)
     fputc('"', f);
 }
 
-/* Emits the whole result set to f as delimited text (used when \o is active).
- * Header row, then data rows; SQL NULL becomes an empty field. */
-static void render_csv(const Table *t, FILE *f, char delim)
+/* Streams the result set to f as delimited text (used when \o is active).
+ * Header row, then data rows pulled from rs; SQL NULL becomes an empty field. */
+static void render_csv(const Table *t, FILE *f, char delim, RowStream *rs)
 {
     for (int c = 0; c < t->ncols; c++) {
         if (c) fputc(delim, f);
         csv_field(f, t->cols[c].name, delim);
     }
     fputc('\n', f);
-    for (int r = 0; r < t->nrows; r++) {
+    int r = 0;
+    while (rowstream_next(rs)) {
         for (int c = 0; c < t->ncols; c++) {
             if (c) fputc(delim, f);
-            const char *v = t->rows[r][c] ? t->rows[r][c] : "";
+            const char *v = rs->cells[c];
             if (cell_is_null(v)) v = "";                 /* NULL -> empty field */
             csv_field(f, v, delim);
         }
         fputc('\n', f);
+        r++;
     }
     fflush(f);
-    printf("%s(%d row%s → file)%s\n\n", CLR_DIM, t->nrows, t->nrows == 1 ? "" : "s", CLR_RESET);
+    printf("%s(%d row%s → file)%s\n\n", CLR_DIM, r, r == 1 ? "" : "s", CLR_RESET);
 }
 
-static void table_render(Table *t)
+/* Renders one result set by streaming its rows over the token buffer starting at
+ * rows_start: a measuring pass computes column widths and the row count, then a
+ * printing pass renders (grid or expanded, or CSV to \o). Returns the buffer
+ * position just past the last row — the terminating (non-row) token. */
+static int render_stream(Table *t, const unsigned char *tok, int rows_start, int len,
+                         char (*cells)[CELL_MAX])
 {
-    if (t->ncols == 0) return;
+    if (t->ncols == 0) return rows_start;
 
-    if (g_out) { render_csv(t, g_out, g_out_delim); return; }  /* \o export path */
-
-    /* natural width of each column = widest of its header and cells (display
-     * cols), capped so one long text column doesn't blow up the grid. */
-    int w[MAX_COLS];
-    long total = 3 * t->ncols + 1;                   /* box borders + separators */
-    for (int c = 0; c < t->ncols; c++) {
-        int mx = utf8_ncols(t->cols[c].name);
-        for (int r = 0; r < t->nrows; r++) {
-            int cl = t->rows[r][c] ? utf8_ncols(t->rows[r][c]) : 0;
-            if (cl > mx) mx = cl;
-        }
-        if (mx < 1) mx = 1;
-        if (mx > NORMAL_CAP) mx = NORMAL_CAP;
-        w[c] = mx;
-        total += mx;
+    /* CSV export needs no widths — a single streaming pass. */
+    if (g_out) {
+        RowStream rs = { tok, rows_start, len, t->cols, t->ncols, cells, 0 };
+        render_csv(t, g_out, g_out_delim, &rs);
+        if (rs.error) printf("%s(row parse error — output truncated)%s\n", CLR_DIM, CLR_RESET);
+        return rs.pos;
     }
 
-    /* If the grid is a touch too wide, steal columns from the widest fields
-     * (clipping their cells with an ellipsis) so the data still fits the screen
-     * as a readable grid instead of dropping straight to the expanded layout. */
+    /* Pass 1 — measure each column's display width and count rows. */
+    int w[MAX_COLS];
+    for (int c = 0; c < t->ncols; c++) {
+        int mx = utf8_ncols(t->cols[c].name);
+        w[c] = mx < 1 ? 1 : mx;
+    }
+    RowStream meas = { tok, rows_start, len, t->cols, t->ncols, cells, 0 };
+    int nrows = 0;
+    while (rowstream_next(&meas)) {
+        for (int c = 0; c < t->ncols; c++) {
+            int cl = utf8_ncols(cells[c]);
+            if (cl > w[c]) w[c] = cl;
+        }
+        nrows++;
+    }
+    int rows_end = meas.pos;
+    t->nrows = nrows;
+    t->truncated = 0;
+
+    /* cap each column, then shrink the widest to fit the terminal */
+    long total = 3 * t->ncols + 1;                   /* box borders + separators */
+    for (int c = 0; c < t->ncols; c++) {
+        if (w[c] > NORMAL_CAP) w[c] = NORMAL_CAP;
+        total += w[c];
+    }
     int avail = term_width();
     while (total > avail) {
         int wc = -1, wmax = MIN_COL;
@@ -429,26 +478,37 @@ static void table_render(Table *t)
         w[wc]--; total--;
     }
 
-    /* Grid when it fits; otherwise fall back to the readable expanded layout. */
+    /* Pass 2 — print, streaming the rows again from the same start. */
+    RowStream out = { tok, rows_start, len, t->cols, t->ncols, cells, 0 };
     if (g_expanded || total > avail)
-        render_expanded(t);
+        render_expanded(t, &out);
     else
-        render_normal(t, w);
+        render_normal(t, w, &out);
+
+    if (meas.error)
+        printf("%s(row parse error — result may be incomplete)%s\n", CLR_DIM, CLR_RESET);
+    return rows_end;
 }
 
 /* Walks a result-set token stream and prints each result set as a table.
- * Handles COLMETADATA, ROW, NBCROW, DONE-family, ERROR/INFO/ENVCHANGE/etc. */
+ * On COLMETADATA the columns are parsed and the following rows are streamed
+ * straight to output (two passes over the buffer, no per-row buffering). Also
+ * handles the DONE-family (rows-affected), ERROR (0xAA) and INFO (0xAB). */
 void parse_result_stream(const unsigned char *tok, int len)
 {
     Table t; memset(&t, 0, sizeof(t));
     int i = 0;
     int any_output = 0;
+    int just_rendered = 0;                  /* last statement produced a result grid */
+
+    /* Reusable scratch: one CELL_MAX buffer per column, grown as needed. */
+    char (*cells)[CELL_MAX] = NULL;
+    int cells_cap = 0;
 
     while (i < len) {
         uint8_t type = tok[i++];
 
         if (type == 0x81) {                        /* COLMETADATA */
-            if (t.ncols > 0 || t.nrows > 0) { table_render(&t); table_reset(&t); }
             if (i + 2 > len) break;
             int count = tok[i] | (tok[i + 1] << 8); i += 2;
             if (count == 0xFFFF) { t.ncols = 0; continue; }  /* no columns */
@@ -461,7 +521,7 @@ void parse_result_stream(const unsigned char *tok, int len)
                 int used = parse_type_info(tok + i, len - i, &t.cols[c]);
                 if (used < 0) {
                     printf("(unsupported column type 0x%02X — stopping)\n", tok[i]);
-                    table_reset(&t); return;
+                    free(cells); return;
                 }
                 i += used;
                 int nu = read_bvarchar_name(tok + i, len - i, t.cols[c].name, sizeof(t.cols[c].name));
@@ -469,48 +529,28 @@ void parse_result_stream(const unsigned char *tok, int len)
                 i += nu;
             }
             any_output = 1;
-        }
-        else if (type == 0xD1) {                   /* ROW */
-            char **row = table_new_row(&t);
-            for (int c = 0; c < t.ncols; c++) {
-                char cell[CELL_MAX]; int used = 0;
-                if (read_cell(&t.cols[c], tok + i, len - i, cell, sizeof(cell), &used) < 0) {
-                    printf("(row parse error at column %d)\n", c); table_reset(&t); return;
-                }
-                i += used;
-                if (row) row[c] = _strdup(cell);
+
+            if (t.ncols > cells_cap) {              /* grow the scratch row */
+                free(cells);
+                cells = malloc((size_t)t.ncols * CELL_MAX);
+                if (!cells) { printf("out of memory\n"); return; }
+                cells_cap = t.ncols;
             }
-        }
-        else if (type == 0xD2) {                   /* NBCROW (null-bitmap compressed) */
-            int nbytes = (t.ncols + 7) / 8;
-            if (i + nbytes > len) break;
-            const unsigned char *bitmap = tok + i; i += nbytes;
-            char **row = table_new_row(&t);
-            for (int c = 0; c < t.ncols; c++) {
-                if (bitmap[c / 8] & (1 << (c % 8))) {        /* bit set -> NULL */
-                    if (row) row[c] = _strdup("NULL");
-                    continue;
-                }
-                char cell[CELL_MAX]; int used = 0;
-                if (read_cell(&t.cols[c], tok + i, len - i, cell, sizeof(cell), &used) < 0) {
-                    printf("(row parse error at column %d)\n", c); table_reset(&t); return;
-                }
-                i += used;
-                if (row) row[c] = _strdup(cell);
-            }
+
+            i = render_stream(&t, tok, i, len, cells);   /* stream this set's rows */
+            just_rendered = 1;
         }
         else if (type == 0xFD || type == 0xFE || type == 0xFF) {  /* DONE / DONEPROC / DONEINPROC */
-            int had_set = (t.ncols > 0);            /* did this statement return a grid? */
-            if (t.ncols > 0 || t.nrows > 0) { table_render(&t); table_reset(&t); }
             if (i + 12 <= len) {
                 int status = tok[i] | (tok[i + 1] << 8);          /* Status(2) */
                 unsigned long long rc = read_uint_le(tok + i + 4, 8);  /* RowCount(8) */
-                if ((status & 0x10) && !had_set) {  /* DONE_COUNT set on a non-result statement */
+                if ((status & 0x10) && !just_rendered) {  /* DONE_COUNT on a non-result statement */
                     printf("%s(%llu row%s affected)%s\n\n",
                            CLR_DIM, rc, rc == 1 ? "" : "s", CLR_RESET);
                     any_output = 1;
                 }
             }
+            just_rendered = 0;
             i += 12;                                /* Status(2) + CurCmd(2) + RowCount(8) */
         }
         else if (type == 0x79) {                   /* RETURNSTATUS */
@@ -530,7 +570,6 @@ void parse_result_stream(const unsigned char *tok, int len)
         }
     }
 
-    if (t.ncols > 0 || t.nrows > 0) table_render(&t);
-    else if (!any_output) printf("%s(command completed, no result set)%s\n\n", CLR_DIM, CLR_RESET);
-    table_reset(&t);
+    if (!any_output) printf("%s(command completed, no result set)%s\n\n", CLR_DIM, CLR_RESET);
+    free(cells);
 }
