@@ -255,18 +255,35 @@ typedef struct {
 } RowStream;
 
 /* Advances to the next ROW/NBCROW, filling rs->cells. Returns 1 on a row, or 0
- * at the end of the result set (rs->pos left at the terminating non-row token);
- * on a framing error returns 0 with rs->error set. */
+ * at the end of the result set (rs->pos left at the terminating token); on a
+ * framing error returns 0 with rs->error set.
+ *
+ * Informational tokens that a server may place between COLMETADATA and the rows
+ * — ORDER (0xA9, emitted for ORDER BY), TABNAME (0xA4), COLINFO (0xA5) — are
+ * skipped so they don't end the scan prematurely. */
 static int rowstream_next(RowStream *rs)
 {
-    if (rs->pos >= rs->len) return 0;
-    uint8_t tp = rs->tok[rs->pos];
-    if (tp != 0xD1 && tp != 0xD2) return 0;
-    int used = read_row_body(rs->cols, rs->ncols, tp == 0xD2,
-                             rs->tok + rs->pos + 1, rs->len - rs->pos - 1, rs->cells);
-    if (used < 0) { rs->error = 1; return 0; }
-    rs->pos += 1 + used;
-    return 1;
+    for (;;) {
+        if (rs->pos >= rs->len) return 0;
+        uint8_t tp = rs->tok[rs->pos];
+
+        if (tp == 0xD1 || tp == 0xD2) {                  /* ROW / NBCROW */
+            int used = read_row_body(rs->cols, rs->ncols, tp == 0xD2,
+                                     rs->tok + rs->pos + 1, rs->len - rs->pos - 1, rs->cells);
+            if (used < 0) { rs->error = 1; return 0; }
+            rs->pos += 1 + used;
+            return 1;
+        }
+
+        if (tp == 0xA9 || tp == 0xA4 || tp == 0xA5) {    /* ORDER / TABNAME / COLINFO: skip */
+            if (rs->pos + 3 > rs->len) return 0;
+            int len = rs->tok[rs->pos + 1] | (rs->tok[rs->pos + 2] << 8);
+            rs->pos += 3 + len;
+            continue;
+        }
+
+        return 0;   /* DONE / next COLMETADATA / anything else ends the rowset */
+    }
 }
 
 /* Classic grid layout in a coloured box: header, separator, streamed rows,
